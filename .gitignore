@@ -1,0 +1,45 @@
+
+# .gitignore for Python and ML projects
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+.env
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Data and Results (Large files)
+results/
+data/
+outputs/
+checkpoints/
+logs/
+*.nii
+*.nii.gz
+*.h5
+*.pth
+*.pt
