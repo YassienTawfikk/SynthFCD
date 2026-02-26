@@ -382,7 +382,7 @@ class DeepVesselNet(nn.Sequential):
     def __init__(self, ndim, in_channels, out_channels,
                  activation='Softmax', kwargs_backbone=None):
         """
-        Parameters
+        Parameters 
         ----------
         ndim : {2, 3}
             Number of spatial dimensions
