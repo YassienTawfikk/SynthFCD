@@ -70,7 +70,7 @@ class UNet(nn.Module):
 
     class defaults:
         nb_levels = 6  # number of levels
-        nb_features = (16, 24, 32, 48, 64, 96, 128, 192, 256, 320)
+        nb_features = (32, 64, 128, 256, 320, 320)
         nb_conv = 2  # number of convolutions per level
         kernel_size = 3  # kernel size
         activation = 'ReLU'  # activation function
