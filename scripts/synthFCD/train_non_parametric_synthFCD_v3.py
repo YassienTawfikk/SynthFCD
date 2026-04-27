@@ -177,7 +177,7 @@ class Model(pl.LightningModule):
             optimizer: str = 'Adam',
             optimizer_options: Optional[dict] = None,
             time_limit_minutes: float = None,
-            modality: str = '',
+            modality: str = 'flair',
             csv_path: Optional[str] = CSV_PATH,
     ):
         super().__init__()
@@ -473,48 +473,49 @@ class Model(pl.LightningModule):
         # Now call train_step which will use the stored optimizer reference
         loss_synth, loss_real = self.network.train_step(
             aug_image, aug_mask, real_image, real_mask)
-
-        self.log('train_loss', loss_synth, prog_bar=True)
-        self.log('train_loss_real', loss_real, prog_bar=False)
-        return loss_synth
+        loss = loss_synth + self.alpha * loss_real
+        self.log('train_loss', loss, prog_bar=True)
+        # self.log('train_loss_real', loss_real, prog_bar=False)
+        return loss
 
     def validation_step(self, batch, batch_idx):
+        # if batch_idx == 0:
+        # Full predictions and diagnostics for first batch only
+        with torch.no_grad():
+            aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
+            loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
+                aug_image, aug_mask, real_image, real_mask)
+            real_labels = real_mask.squeeze(1)  # Use real_mask you already have
+
+        # Convert to CPU and get label indices
+        pred_real_cpu = pred_real.cpu()
+        real_mask_cpu = real_mask.cpu()
+
+        pred_labels = pred_real_cpu.argmax(dim=1)  # [B, H, W, D]
+        target_labels = real_mask_cpu.squeeze(1).long()  # [B, H, W, D]
+
+        # FIX: Update the CLASS-LEVEL metrics, not a local one
+        self.val_dice.update(pred_labels, target_labels)
+        self.val_dice_fcd.update(pred_labels, target_labels)
         if batch_idx == 0:
-            # Full predictions and diagnostics for first batch only
-            with torch.no_grad():
-                aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
-                loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
-                    aug_image, aug_mask, real_image, real_mask)
-                real_labels = real_mask.squeeze(1)  # Use real_mask you already have
-
-            # Convert to CPU and get label indices
-            pred_real_cpu = pred_real.cpu()
-            real_mask_cpu = real_mask.cpu()
-
-            pred_labels = pred_real_cpu.argmax(dim=1)  # [B, H, W, D]
-            target_labels = real_mask_cpu.squeeze(1).long()  # [B, H, W, D]
-
-            # FIX: Update the CLASS-LEVEL metrics, not a local one
-            self.val_dice.update(pred_labels, target_labels)
-            self.val_dice_fcd.update(pred_labels, target_labels)
             # Log diagnostics
             self._log_val_diagnostics(pred_synth, pred_labels, aug_image,
                                       real_image, aug_mask, target_labels)
 
-            loss = loss_synth + self.alpha * loss_real
-            self.log('eval_loss', loss, prog_bar=True)
-            return loss
+        loss = loss_synth + self.alpha * loss_real
+        self.log('eval_loss', loss, prog_bar=True)
+        return loss
 
-        else:
-            # Lightweight computation for remaining batches
-            with torch.no_grad():
-                aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
-                loss_synth, loss_real = self.network.eval_step(
-                    aug_image, aug_mask, real_image, real_mask)
+        # else:
+        #     # Lightweight computation for remaining batches
+        #     with torch.no_grad():
+        #         aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
+        #         loss_synth, loss_real = self.network.eval_step(
+        #             aug_image, aug_mask, real_image, real_mask)
 
-            loss = loss_synth + self.alpha * loss_real
-            self.log('eval_loss', loss, prog_bar=True)
-            return loss
+        #     loss = loss_synth + self.alpha * loss_real
+        #     self.log('eval_loss', loss, prog_bar=True)
+        #     return loss
 
     def _log_val_diagnostics(self, pred_synth, pred_labels, aug_image,
                              real_image, aug_mask, real_labels):
