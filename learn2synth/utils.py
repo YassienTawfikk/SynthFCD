@@ -76,7 +76,7 @@ def make_vector(input, n=None, crop=True, *args,
         default = kwargs['default']
     else:
         default = input[-1]
-    default = input.new_full([n-len(input)], default)
+    default = input.new_full([n - len(input)], default)
     return torch.cat([input, default])
 
 
@@ -136,15 +136,21 @@ if torch_version('>=', (1, 10)):
     @torch.jit.script
     def meshgrid_script_ij(x: List[torch.Tensor]) -> List[Tensor]:
         return torch.meshgrid(x, indexing='ij')
+
+
     @torch.jit.script
     def meshgrid_script_xy(x: List[torch.Tensor]) -> List[Tensor]:
         return torch.meshgrid(x, indexing='xy')
+
+
     meshgrid_ij = lambda *x: torch.meshgrid(*x, indexing='ij')
     meshgrid_xy = lambda *x: torch.meshgrid(*x, indexing='xy')
 else:
     @torch.jit.script
     def meshgrid_script_ij(x: List[torch.Tensor]) -> List[Tensor]:
         return torch.meshgrid(x)
+
+
     @torch.jit.script
     def meshgrid_script_xy(x: List[torch.Tensor]) -> List[Tensor]:
         grid = torch.meshgrid(x)
@@ -152,7 +158,11 @@ else:
             grid[0] = grid[0].transpose(0, 1)
             grid[1] = grid[1].transpose(0, 1)
         return grid
+
+
     meshgrid_ij = lambda *x: torch.meshgrid(*x)
+
+
     def meshgrid_xy(*x):
         grid = list(torch.meshgrid(*x))
         if len(grid) > 1:

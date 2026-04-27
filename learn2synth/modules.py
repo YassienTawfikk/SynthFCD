@@ -139,7 +139,7 @@ class UpsampleConvLike(nn.Module):
 
         """
         return warps.upsample_convlike(
-            flow,  self.kernel_size, self.stride, self.padding, shape)
+            flow, self.kernel_size, self.stride, self.padding, shape)
 
 
 class DownsampleConvLike(nn.Module):
@@ -203,7 +203,7 @@ class SeparableConv(nn.Sequential):
             K1 = [1] * ndim
             K1[dim] = K
             kwargs = dict(kernel_size=K1, dilation=D,
-                          padding='same', bias=bias and (dim == ndim-1),
+                          padding='same', bias=bias and (dim == ndim - 1),
                           padding_mode=padding_mode)
             layers.append(klass(in_channels, out_channels, **kwargs))
 
@@ -304,15 +304,15 @@ class ConvBlockBase(nn.Sequential):
             activation = getattr(nn, activation)
         activation = (activation() if inspect.isclass(activation)
                       else activation if callable(activation)
-                      else None)
+        else None)
         return activation
 
     @staticmethod
     def make_dropout(dropout, ndim):
         dropout = (dropout() if inspect.isclass(dropout)
                    else dropout if callable(dropout)
-                   else getattr(nn, f'Dropout{ndim}d')(p=float(dropout)) if dropout
-                   else None)
+        else getattr(nn, f'Dropout{ndim}d')(p=float(dropout)) if dropout
+        else None)
         return dropout
 
     @staticmethod
@@ -335,8 +335,8 @@ class ConvBlockBase(nn.Sequential):
                 norm = getattr(nn, f'BatchNorm{ndim}d')
         norm = (norm(in_channels, in_channels) if norm is nn.GroupNorm
                 else norm(in_channels) if inspect.isclass(norm)
-                else norm if callable(norm)
-                else None)
+        else norm if callable(norm)
+        else None)
         return norm
 
 
@@ -465,7 +465,7 @@ class StridedConvBlockUp(ConvBlockBase):
         output_padding = 0
         if shape is not None:
             shape = utils.ensure_list(shape, x.dim() - 2)
-            shape_out = [(l + 2 * p - k)//s + 1 for l, k, s, p
+            shape_out = [(l + 2 * p - k) // s + 1 for l, k, s, p
                          in zip(shape_in, kernel_size, stride, padding)]
             output_padding = [s - so for s, so in zip(shape, shape_out)]
         self.conv.output_padding = output_padding
@@ -578,7 +578,7 @@ class ConvGroup(nn.Sequential):
 
     def __init__(self, ndim, in_channels, mid_channels=None, out_channels=None,
                  kernel_size=3, nb_conv=1, dilation=1, recurrent=False, residual=False,
-                 bias=True, activation='ReLU', norm=None,  dropout=False,
+                 bias=True, activation='ReLU', norm=None, dropout=False,
                  order='ncda', separable=False):
         """
 
@@ -775,6 +775,7 @@ class Hadamard(nn.Module):
 
     (x, y) -> (x + y, x - y)
     """
+
     def forward(self, x, y=None):
         """
 
@@ -790,7 +791,7 @@ class Hadamard(nn.Module):
         """
         if y is None:
             nc = x.shape[1]
-            x, y = x[:, :(nc//2)], x[:, (nc//2):]
+            x, y = x[:, :(nc // 2)], x[:, (nc // 2):]
         return torch.cat([x + y, x - y], dim=1)
 
 

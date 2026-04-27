@@ -1,0 +1,875 @@
+import pytorch_lightning as pl
+from pytorch_lightning.cli import LightningCLI
+from pytorch_lightning.callbacks import ModelCheckpoint
+import sys
+
+#sys.path.append('..')
+# import os
+# ext_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '/local/scratch/.cache/projects/training_synthseg/Learn2Synth/learn2synth'))
+# sys.path.append(ext_path)
+
+import sys
+import os
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))  # or hardcode if needed
+sys.path.append(project_root)
+
+
+from learn2synth.networks import UNet, SegNet
+from learn2synth.train import LearnableSynthSeg, SynthSeg
+from learn2synth.losses import DiceLoss, LogitMSELoss, CatLoss, CatMSELoss
+from learn2synth.metrics import Dice, Hausdorff
+from learn2synth import optim
+from cornucopia import (
+    SynthFromLabelTransform, LoadTransform, NonFinalTransform, FinalTransform
+)
+import cornucopia as cc
+from learn2synth.utils import folder2files
+from torch.utils.data import Dataset, DataLoader
+from typing import Sequence, List, Tuple, Optional, Union
+from glob import glob
+from os import path, makedirs
+from ast import literal_eval
+from random import shuffle
+import nibabel as nib
+import numpy as np
+import torch
+import math
+import fnmatch
+import random
+import torch.nn.functional as F
+# from torchmetrics.classification import Dice as dice_compute
+from torchmetrics.segmentation import DiceScore as dice_compute
+
+class Noisify(torch.nn.Module):
+    """
+    An extremely simple synth+ network that just 
+    adds scaled Gaussian noise
+    """
+    def __init__(self):
+        super().__init__()
+        self.sigma = torch.nn.Parameter(torch.rand([]), requires_grad=True)
+
+    def forward(self, x):
+        return x + torch.randn_like(x) * self.sigma.to(x)
+
+class Model(pl.LightningModule):
+
+    def __init__(self,
+                 ndim: int = 3,
+                 nb_classes: int = 9,
+                 seg_nb_levels: int = 6,
+                 seg_features: Sequence[int] = (16, 32, 64, 128, 256, 512),
+                 seg_activation: str = 'ReLU',
+                 seg_nb_conv: int = 2,
+                 seg_norm: Optional[str] = 'instance',
+                 synth_nb_levels: int = 1,
+                 synth_features: Tuple[int] = (16,),
+                 synth_activation: str = 'ELU',
+                 synth_nb_conv: int = 1,
+                 synth_norm: Optional[str] = None,
+                 synth_residual: bool = True,
+                 #  synth_shared: bool = True,
+                 loss: str = 'dice',
+                 alpha: float = 1.,
+                 real_sigma_min: float = 0.15,
+                 real_sigma_max: float = 0.15,
+                 real_low: float = 0.5, 
+                 real_middle: float = 0.5,
+                 real_high: float = 0.5,
+                 classic: bool = True,
+                 optimizer: str = 'Adam',
+                 optimizer_options: dict = dict(lr=1e-4),
+                 # metrics: dict = dict(dice='dice'),
+                 ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.optimizer = optimizer
+        self.optimizer_options = dict(optimizer_options or {})
+        self.alpha = alpha
+        self.real_sigma_min = real_sigma_min
+        self.real_sigma_max = real_sigma_max
+        self.real_low = real_low
+        self.real_middle = real_middle
+        self.real_high = real_high
+        self.classic = classic
+
+        segnet = UNet(
+            ndim,
+            features=seg_features,
+            activation=seg_activation,
+            nb_levels=seg_nb_levels,
+            nb_conv=seg_nb_conv,
+            norm=seg_norm,
+        )
+        segnet = SegNet(ndim, 1, nb_classes, backbone=segnet, activation=None)
+
+        # synth = SharedSynth if synth_shared else DiffSynth
+        # synth = cc.batch(synth(SynthFromLabelTransform(order=1)))
+
+        target_labels = [
+                        (1001,),  # Hippocampus Gray Matter
+                        (1002,),  # Hippocampus SRLM
+                        (1003,),  # Hippocampus MTLC
+                        (1004,),  # Hippocampus Pial Surface
+                        (1005,),  # Hippocampus HATA
+                        (1006,),  # Hippocampus Indusium Griseum
+                        (1007,),  # Hippocampus Cyst
+                        (1008,),  # Hippocampus Dentate Gyrus
+                        # (3,),     # Amygdala (left and right)
+                        # (5,),     # Anterior temporal lobe, medial part (left and right GM)
+                        # (7,),     # Anterior temporal lobe, lateral part (left and right GM)
+                        # (9,),     # Gyri parahippocampalis et ambiens anterior part (left and right GM)
+                        # (11,),    # Superior temporal gyrus, middle part (left and right GM)
+                        # (13,),    # Medial and inferior temporal gyri anterior part (left and right GM)
+                        # (15,),    # Lateral occipitotemporal gyrus, gyrus fusiformis anterior part (left and right GM)
+                        # (17,),    # Cerebellum (left and right)
+                        # (19,),    # Brainstem, spans the midline
+                        # (21,),    # Insula (left and right GM)
+                        # (23,),    # Occipital lobe (left and right GM)
+                        # (25,),    # Gyri parahippocampalis et ambiens posterior part (left and right GM)
+                        # (27,),    # Lateral occipitotemporal gyrus, gyrus fusiformis posterior part (left and right GM)
+                        # (29,),    # Medial and inferior temporal gyri posterior part (left and right GM)
+                        # (31,),    # Superior temporal gyrus, posterior part (left and right GM)
+                        # (33,),    # Cingulate gyrus, anterior part (left and right GM)
+                        # (35,),    # Cingulate gyrus, posterior part (left and right GM)
+                        # (37,),    # Frontal lobe (left and right GM)
+                        # (39,),    # Parietal lobe (left and right GM)
+                        # (41,),    # Caudate nucleus (left and right)
+                        # (43,),    # Thalamus, high intensity part in T2 (left and right)
+                        # (45,),    # Subthalamic nucleus (left and right)
+                        # (47,),    # Lentiform Nucleus (left and right)
+                        # (48,),    # Corpus Callosum
+                        # (49,),    # Lateral Ventricle (left and right)
+                        # (51,),    # Anterior temporal lobe, medial part (left and right WM)
+                        # (53,),    # Anterior temporal lobe, lateral part (left and right WM)
+                        # (55,),    # Gyri parahippocampalis et ambiens anterior part (left and right WM)
+                        # (57,),    # Superior temporal gyrus, middle part (left and right WM)
+                        # (59,),    # Medial and inferior temporal gyri anterior part (left and right WM)
+                        # (61,),    # Lateral occipitotemporal gyrus, gyrus fusiformis anterior part (left and right WM)
+                        # (63,),    # Insula (left and right WM)
+                        # (65,),    # Occipital lobe (left and right WM)
+                        # (67,),    # Gyri parahippocampalis et ambiens posterior part (left and right WM)
+                        # (69,),    # Lateral occipitotemporal gyrus, gyrus fusiformis posterior part (left and right WM)
+                        # (71,),    # Medial and inferior temporal gyri posterior part (left and right WM)
+                        # (73,),    # Superior temporal gyrus, posterior part (left and right WM)
+                        # (75,),    # Cingulate gyrus, anterior part (left and right WM)
+                        # (77,),    # Cingulate gyrus, posterior part (left and right WM)
+                        # (79,),    # Frontal lobe (left and right WM)
+                        # (81,),    # Parietal lobe (left and right WM)
+                        # (83,),    # CSF
+                        # (84,),    # Extra-cranial background
+                        # (85,),    # Intra-cranial background
+                        # (87,),    # Thalamus, low intensity part in T2 (left and right)
+                    ]
+
+
+
+        synth = SynthFromLabelTransform(
+            order=1,
+            resolution=False,
+            snr=False,
+            bias=False,
+            target_labels=target_labels
+        )
+
+        # synth = SynthFromLabelTransform(order=1, resolution=False, snr=False, bias=False)
+        # synth = cc.batch(DiffSynthFull(synth, real_sigma_min=real_sigma_min, real_sigma_max=real_sigma_max, \
+        #                                real_low=real_low, real_middle=real_middle, real_high=real_high, classic=classic))
+
+        synth = cc.batch(Real(synth))
+        
+        if loss == 'dice':
+            # Weight classes to handle severe imbalance (background: 99.7%, hippocampus: 0.3%)
+            # Background gets low weight, hippocampus classes get high weight
+            # class_weights = [0.1, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+            # loss = DiceLoss(activation=None, weighted=class_weights)
+            loss = DiceLoss(activation='Softmax')
+        elif loss == 'logitmse':
+            loss = LogitMSELoss()
+        elif loss == 'cat':
+            loss = CatLoss(activation='Softmax')
+        elif loss == 'catmse':
+            loss = CatMSELoss(activation='Softmax')
+        elif isinstance(loss, str):
+            raise ValueError('Unsupported loss', loss)
+
+        # metrics = metrics or {}
+        # for key, val in metrics:
+        #     if val == 'dice':
+        #         val = Dice()
+        #     elif val == 'hausdorff95':
+        #         val = Hausdorff(pct=0.95)
+        #     elif val == 'hausdorff':
+        #         val = Hausdorff()
+        #     elif isinstance(val, str):
+        #         raise ValueError('Unsupported loss', loss)
+        #     metrics[key] = val
+        # self.metrics = metrics
+
+        self.classic = classic
+        if self.classic:
+            self.network = SynthSeg(segnet, synth, loss)
+        else:
+            # synthnet = Noisify_Bias_Field()
+            synthnet = UNet(
+                ndim,
+                features=synth_features,
+                activation=synth_activation,
+                nb_levels=synth_nb_levels,
+                nb_conv=synth_nb_conv,
+                norm=synth_norm,
+            )
+            synthnet = SegNet(ndim, 1, 1, backbone=synthnet, activation=None)
+            synthnet = torch.nn.Sequential(synthnet, Noisify())
+
+            self.network = LearnableSynthSeg(segnet, synth, synthnet, loss, alpha,
+                                             residual=synth_residual)
+
+        self.automatic_optimization = False
+        self.network.set_backward(self.manual_backward)
+
+    def configure_optimizers(self):
+        optimizer = getattr(optim, self.optimizer)
+        optimizer_init = lambda x: optimizer(x, **(self.optimizer_options or {}))
+        optimizers = self.network.configure_optimizers(optimizer_init)
+        self.network.set_optimizers(self.optimizers)
+        return optimizers
+
+    def training_step(self, batch, batch_idx):
+        # self.trainer.fit_loop.max_epochs = 10000        
+        if self.trainer.current_epoch % 10 == 0 and batch_idx == 0:
+            torch.cuda.empty_cache()
+
+        loss_synth, loss_real = self.network.synth_and_train_step(*batch)
+        loss = loss_synth + self.alpha * loss_real
+        name = type(self.network.loss).__name__
+        # self.log(f'train_loss_synth_{name}', loss_synth)
+        # self.log(f'train_loss_real_{name}', loss_real)
+        # self.log(f'train_loss_{name}', loss)
+        if self.classic:
+            self.log(f'train_loss', loss, prog_bar=True)
+        else:        
+            self.log(f'train_loss', loss, prog_bar=True)
+            self.log(f'sigma', self.network.synthnet[1].sigma, prog_bar=True)
+        
+        return loss
+
+    # def validation_step(self, batch, batch_idx):
+    #     name = type(self.network.loss).__name__
+    #     dice_real = 0
+    #     if self.classic:
+    #         if batch_idx == 0:
+    #             root = f'{self.logger.log_dir}/images'
+    #             makedirs(root, exist_ok=True)
+    #             epoch = self.trainer.current_epoch
+    #             loss_synth, loss_real, pred_synth, pred_real, \
+    #             synth_image, synth_ref, real_image, real_ref \
+    #                 = self.network.synth_and_eval_for_plot(*batch)
+                
+    #             # if epoch % 10 == 0:
+    #             dice_score = dice_compute(average='micro', include_background=False, num_classes=9)
+                
+    #             # Move predictions to CPU and ensure correct shape
+    #             pred_real = pred_real.cpu()  # [B, C, H, W, D]
+    #             real_ref = real_ref.cpu()    # [B, 1, H, W, D]
+                
+    #             # Compute dice for each batch element
+    #             for i in range(pred_real.shape[0]):
+    #                 # Get predictions and ensure correct shape
+    #                 pred = pred_real[i]  # [C, H, W, D]
+    #                 pred = pred.argmax(dim=0)  # [H, W, D]
+    #                 pred = pred.unsqueeze(0)  # [1, H, W, D]
+
+                    
+    #                 # Get target and ensure correct shape
+    #                 target = real_ref[i]  # [1, H, W, D]
+                                        
+    #                 # Compute dice score
+    #                 dice_real += dice_score(pred, target)
+                    
+    #                 dice_real /= pred_real.shape[0]
+    #                 self.log(f'dice_real', dice_real, prog_bar=True)
+
+    #                 # Save predicted label maps (argmax over channel dim 0) for the first batch element
+    #                 pred_synth_argmax = pred_synth[0].argmax(dim=0)
+    #                 pred_real_argmax = pred_real[0].argmax(dim=0)
+    #                 self.log(f'pred_synth_num_classes', len(torch.unique(pred_synth_argmax)), prog_bar=True)
+    #                 self.log(f'pred_real_num_classes', len(torch.unique(pred_real_argmax)), prog_bar=True)
+                    
+    #                 if epoch % 10 == 0:
+    #                     save(pred_synth_argmax,
+    #                         f'{root}/epoch-{epoch:04d}_synth-pred.nii.gz')
+    #                     save(pred_real_argmax,
+    #                         f'{root}/epoch-{epoch:04d}_real-pred.nii.gz')
+    #                     # Save images and references for the first batch element
+    #                     save(synth_image[0].squeeze(0),
+    #                         f'{root}/epoch-{epoch:04d}_synth-image.nii.gz')
+    #                     save(real_image[0].squeeze(0),
+    #                         f'{root}/epoch-{epoch:04d}_real-image.nii.gz')
+    #                     save(synth_ref[0].squeeze(0).to(torch.uint8),
+    #                         f'{root}/epoch-{epoch:04d}_synth-ref.nii.gz')
+    #                     save(real_ref[0].squeeze(0).to(torch.uint8),
+    #                         f'{root}/epoch-{epoch:04d}_real-ref.nii.gz')
+    #         else:
+    #             loss_synth, loss_real = self.network.synth_and_eval_step(*batch)
+    #     else:
+    #         if batch_idx == 0:
+    #             root = f'{self.logger.log_dir}/images'
+    #             makedirs(root, exist_ok=True)
+    #             epoch = self.trainer.current_epoch
+    #             loss_synth, loss_synth0, loss_real, \
+    #             pred_synth, pred_synth0, pred_real, \
+    #             synth_image, synth0_image, synth_ref, real_image, real_ref \
+    #                 = self.network.synth_and_eval_for_plot(*batch)
+                
+                
+    #             # if epoch % 10 == 0:
+    #             dice_score = dice_compute(average='micro', include_background=False, num_classes=9)
+                
+    #             # Move predictions to CPU and ensure correct shape
+    #             pred_real = pred_real.cpu()  # [B, C, H, W, D]
+    #             real_ref = real_ref.cpu()    # [B, 1, H, W, D]
+
+    #             # Compute dice for each batch element
+    #             for i in range(pred_real.shape[0]):
+    #                 # Get predictions and ensure correct shape
+    #                 pred = pred_real[i]  # [C, H, W, D]
+    #                 pred = pred.argmax(dim=0)  # [H, W, D]
+    #                 pred = pred.unsqueeze(0)  # [1, H, W, D]
+
+    #                 # Get target and ensure correct shape
+    #                 target = real_ref[i]  # [1, H, W, D]
+
+    #                 # Compute dice score
+    #                 dice_real += dice_score(pred, target)
+                    
+    #                 dice_real /= real_ref.shape[0]
+    #                 self.log(f'dice_real', dice_real, prog_bar=True)
+
+
+    #                 # Save predicted label maps (argmax over channel dim 0) for the first batch element                    
+    #                 pred_synth_argmax = pred_synth[0].argmax(dim=0)
+    #                 pred_real_argmax = pred_real[0].argmax(dim=0)
+    #                 self.log(f'pred_synth_num_classes', len(torch.unique(pred_synth_argmax)), prog_bar=True)
+    #                 self.log(f'pred_real_num_classes', len(torch.unique(pred_real_argmax)), prog_bar=True)
+
+    #                 if epoch % 10 == 0:
+    #                     save(pred_synth_argmax,
+    #                         f'{root}/epoch-{epoch:04d}_synth-pred.nii.gz')
+    #                     save(pred_real_argmax,
+    #                         f'{root}/epoch-{epoch:04d}_real-pred.nii.gz')
+    #                     # Save images and references for the first batch element
+    #                     save(synth_image[0].squeeze(0),
+    #                         f'{root}/epoch-{epoch:04d}_synth-image.nii.gz')
+    #                     save(real_image[0].squeeze(0),
+    #                         f'{root}/epoch-{epoch:04d}_real-image.nii.gz')
+    #                     save(synth_ref[0].squeeze(0).to(torch.uint8),
+    #                         f'{root}/epoch-{epoch:04d}_synth-ref.nii.gz')
+    #                     save(real_ref[0].squeeze(0).to(torch.uint8),
+    #                         f'{root}/epoch-{epoch:04d}_real-ref.nii.gz')
+    #         else:
+    #             loss_synth, loss_synth0, loss_real = self.network.synth_and_eval_step(*batch)
+    #         # self.log(f'eval_loss_synth0_{name}', loss_synth0)
+    #     loss = loss_synth + self.alpha * loss_real
+    #     # self.log(f'eval_loss_synth_{name}', loss_synth)
+    #     # self.log(f'eval_loss_real_{name}', loss_real)
+    #     # self.log(f'eval_loss_{name}', loss)
+    #     self.log(f'eval_loss', loss)
+    #     return loss
+
+    def validation_step(self, batch, batch_idx):
+        dice_real = 0
+
+        if self.classic:
+            if batch_idx == 0:
+                root = f'{self.logger.log_dir}/images'
+                makedirs(root, exist_ok=True)
+                epoch = self.trainer.current_epoch
+
+                loss_synth, loss_real, pred_synth, pred_real, \
+                synth_image, synth_ref, real_image, real_ref \
+                    = self.network.synth_and_eval_for_plot(*batch)
+
+                # Initialize Dice metric (once per step)
+                dice_score = dice_compute(average='micro', include_background=False, num_classes=9, input_format="index")
+
+                # Move to CPU and convert predictions to label indices
+                pred_real = pred_real.cpu()  # [B, C, H, W, D]
+                real_ref = real_ref.cpu()    # [B, 1, H, W, D]
+
+                # Convert logits/probs to predicted labels
+                pred_labels = pred_real.argmax(dim=1)  # [B, H, W, D]
+                target_labels = real_ref.squeeze(1)    # [B, H, W, D]
+
+                # Update metric with batch tensors (no loop)
+                dice_score.update(pred_labels, target_labels)
+
+                # Compute Dice
+                dice_real = dice_score.compute()
+
+                # Log the computed Dice score
+                self.log('dice_real', dice_real, prog_bar=True)
+
+                # Save predicted label maps for first batch element
+                pred_synth_argmax = pred_synth[0].argmax(dim=0)
+                pred_real_argmax = pred_real[0].argmax(dim=0)
+
+                self.log('pred_synth_num_classes', len(torch.unique(pred_synth_argmax)), prog_bar=True)
+                self.log('pred_real_num_classes', len(torch.unique(pred_real_argmax)), prog_bar=True)
+
+                if epoch % 10 == 0:
+                    save(pred_synth_argmax, f'{root}/epoch-{epoch:04d}_synth-pred.nii.gz')
+                    save(pred_real_argmax, f'{root}/epoch-{epoch:04d}_real-pred.nii.gz')
+                    save(synth_image[0].squeeze(0), f'{root}/epoch-{epoch:04d}_synth-image.nii.gz')
+                    save(real_image[0].squeeze(0), f'{root}/epoch-{epoch:04d}_real-image.nii.gz')
+                    save(synth_ref[0].squeeze(0).to(torch.uint8), f'{root}/epoch-{epoch:04d}_synth-ref.nii.gz')
+                    save(real_ref[0].squeeze(0).to(torch.uint8), f'{root}/epoch-{epoch:04d}_real-ref.nii.gz')
+            else:
+                loss_synth, loss_real = self.network.synth_and_eval_step(*batch)
+
+        else:
+            if batch_idx == 0:
+                root = f'{self.logger.log_dir}/images'
+                makedirs(root, exist_ok=True)
+                epoch = self.trainer.current_epoch
+
+                loss_synth, loss_synth0, loss_real, \
+                pred_synth, pred_synth0, pred_real, \
+                synth_image, synth0_image, synth_ref, real_image, real_ref \
+                    = self.network.synth_and_eval_for_plot(*batch)
+
+                dice_score = dice_compute(average='micro', include_background=False, num_classes=9, input_format="index")
+
+                pred_real = pred_real.cpu()
+                real_ref = real_ref.cpu()
+
+                pred_labels = pred_real.argmax(dim=1)  # [B, H, W, D]
+                target_labels = real_ref.squeeze(1)    # [B, H, W, D]
+
+                dice_score.update(pred_labels, target_labels)
+                dice_real = dice_score.compute()
+
+                self.log('dice_real', dice_real, prog_bar=True)
+
+                pred_synth_argmax = pred_synth[0].argmax(dim=0)
+                pred_real_argmax = pred_real[0].argmax(dim=0)
+                self.log('pred_synth_num_classes', len(torch.unique(pred_synth_argmax)), prog_bar=True)
+                self.log('pred_real_num_classes', len(torch.unique(pred_real_argmax)), prog_bar=True)
+
+                if epoch % 10 == 0:
+                    save(pred_synth_argmax, f'{root}/epoch-{epoch:04d}_synth-pred.nii.gz')
+                    save(pred_real_argmax, f'{root}/epoch-{epoch:04d}_real-pred.nii.gz')
+                    save(synth_image[0].squeeze(0), f'{root}/epoch-{epoch:04d}_synth-image.nii.gz')
+                    save(real_image[0].squeeze(0), f'{root}/epoch-{epoch:04d}_real-image.nii.gz')
+                    save(synth_ref[0].squeeze(0).to(torch.uint8), f'{root}/epoch-{epoch:04d}_synth-ref.nii.gz')
+                    save(real_ref[0].squeeze(0).to(torch.uint8), f'{root}/epoch-{epoch:04d}_real-ref.nii.gz')
+
+            else:
+                loss_synth, loss_synth0, loss_real = self.network.synth_and_eval_step(*batch)
+
+        loss = loss_synth + self.alpha * loss_real
+        self.log('eval_loss', loss)
+        return loss
+
+
+    def forward(self, x):
+        return self.network(x)
+
+
+def save(dat, fname):
+    # dat = dat[:, :, None]
+    dat = dat.detach().cpu().numpy()
+    h = nib.Nifti1Header()
+    h.set_data_dtype(dat.dtype)
+    nib.save(nib.Nifti1Image(dat, np.eye(4), h), fname)
+
+
+class Real(torch.nn.Module):
+    """Return the real"""
+
+    def __init__(self, synth):
+        super().__init__()
+        self.synth = synth
+
+    def forward(self, slab, img, lab):
+        # Create mask for labels 1001 to 1008
+        mask = (lab >= 1001) & (lab <= 1008)
+
+        # Zero out everything else
+        new_lab = torch.zeros_like(lab)
+
+        # Subtract 1000 from relevant labels
+        new_lab[mask] = lab[mask] - 1000
+
+        return img, new_lab, img, new_lab
+    
+class SharedSynth(torch.nn.Module):
+    """Apply the same geometric transform for synth and real"""
+
+    def __init__(self, synth):
+        super().__init__()
+        self.synth = synth
+
+    def forward(self, slab, img, lab):
+        final = self.synth.make_final(slab, 1)
+        final.deform = final.deform.make_final(slab)
+        simg, slab = final(slab)
+        rimg, rlab = final.deform([img, lab])
+        rimg = final.intensity(rimg)
+        rlab = final.postproc(rlab)
+        return simg, slab, rimg, rlab
+
+
+# class DiffSynth(torch.nn.Module):
+#     """Apply different geometric transform for synth and real"""
+
+#     def __init__(self, synth):
+#         super().__init__()
+#         self.synth = synth
+
+#     def forward(self, slab, img, lab):
+#         # slab: labels of the source (synth) domain
+#         # img: image of the target (real) domain
+#         # lab: label of the target (real) domain
+#         final = self.synth.make_final(slab, 1)
+#         final.deform = final.deform.make_final(slab)
+#         simg, slab = final(slab)
+#         rimg, rlab = final.deform(img, lab)
+#         rimg = final.intensity(img)
+#         rlab = final.postproc(rlab)
+#         return simg, slab, rimg, rlab
+
+class DiffSynth(torch.nn.Module):
+    """Apply different geometric transforms for synth and real, preserving intra-domain alignment"""
+
+    def __init__(self, synth):
+        super().__init__()
+        self.synth = synth
+
+    def forward(self, slab, img, lab):
+        # Synthetic: sample transform specific to slab
+        final_synth = self.synth.make_final(slab, 1)
+        final_synth.deform = final_synth.deform.make_final(slab)
+        simg, slab = final_synth(slab)
+
+        # Real: sample a separate transform specific to img/lab (but shared between them)
+        final_real = self.synth.make_final(img, 1)
+        final_real.deform = final_real.deform.make_final(img)
+        rimg, rlab = final_real.deform([img, lab])  # ensure same deformation applied
+        rimg = final_real.intensity(rimg)
+        rlab = final_real.postproc(rlab)
+
+        return simg, slab, rimg, rlab
+
+
+
+class DiffSynthFull(torch.nn.Module):
+    """
+    Generate two fully synthetic images.
+    One of them (the target) has noise.
+    The other (the source) does not have noise.
+    """
+
+    def __init__(self, synth, real_sigma_min=0.15, real_sigma_max=0.15, real_low=0.5, real_middle=0.5, real_high=0.5, classic=False):
+        super().__init__()
+        self.synth = synth
+        self.real_sigma_min = real_sigma_min
+        self.real_sigma_max = real_sigma_max
+        self.real_low = real_low
+        self.real_middle = real_middle
+        self.real_high = real_high
+        self.classic = classic
+
+    def forward(self, slab, _, tlab):
+        # slab: labels of the source (synth) domain
+        # tlab: label of the target (real) domain
+
+        real_sigma = random.uniform(self.real_sigma_min, self.real_sigma_max)
+
+        low_bound = 0.5
+        up_bound = 2
+
+        # Create 3D bias fields with appropriate sizes
+        bias_field_ori_low = torch.rand([2, 2, 2]) * (up_bound - low_bound) + low_bound
+        bias_field_ori_middle = torch.rand([4, 4, 4]) * (up_bound - low_bound) + low_bound
+        bias_field_ori_high = torch.rand([8, 8, 8]) * (up_bound - low_bound) + low_bound
+
+        simg, slab = self.synth(slab)
+        timg, tlab = self.synth(tlab)
+
+        # Interpolate bias fields to match input dimensions (128x256x128)
+        bias_field_low = F.interpolate(bias_field_ori_low.unsqueeze(0).unsqueeze(0), 
+                                     size=(timg.shape[1], timg.shape[2], timg.shape[3]), 
+                                     mode='trilinear', 
+                                     align_corners=False).to(timg)
+        bias_field_middle = F.interpolate(bias_field_ori_middle.unsqueeze(0).unsqueeze(0), 
+                                        size=(timg.shape[1], timg.shape[2], timg.shape[3]), 
+                                        mode='trilinear', 
+                                        align_corners=False).to(timg)
+        bias_field_high = F.interpolate(bias_field_ori_high.unsqueeze(0).unsqueeze(0), 
+                                      size=(timg.shape[1], timg.shape[2], timg.shape[3]), 
+                                      mode='trilinear', 
+                                      align_corners=False).to(timg)
+
+        if self.classic:
+            simg = simg * (bias_field_low.squeeze(0) ** self.real_low) * \
+                   (bias_field_middle.squeeze(0) ** self.real_middle) * \
+                   (bias_field_high.squeeze(0) ** self.real_high) + \
+                   torch.randn_like(simg) * real_sigma
+        else:
+            pass
+
+        timg = timg * (bias_field_low.squeeze(0) ** self.real_low) * \
+               (bias_field_middle.squeeze(0) ** self.real_middle) * \
+               (bias_field_high.squeeze(0) ** self.real_high) + \
+               torch.randn_like(timg) * real_sigma
+        return simg, slab, timg, tlab
+
+
+class PairedDataset(Dataset):
+    """
+    A dataset of paired images and labels.
+
+    The dataset returns a three-tuple of:
+        1) a label map to use for synth
+        2) a real image
+        3) a real label map
+    If `split_synth_real` is False, the same label map is used for (1)
+    and (3). Otherwise, the dataset is split in two, and the first half
+    is used for synthesis and the other half for real examples.
+    """
+
+    def __init__(self, ndim, images, labels, split_synth_real=True,
+                 subset=None, device=None):
+        """
+
+        Parameters
+        ----------
+        ndim : int
+            Number of spatial dimensions
+        labels : [sequence of] str
+            Input label maps: folder or file pattern or list of files.
+        images : [sequence of] str
+            Input images: folder or file pattern or list of files.
+        split_synth_real : bool
+            Do not use the same label map for real and synth examples
+            in each batch.
+        subset : slice or list[int]
+            Only use a subset of the input files
+        device : torch.device
+            Device on which to load the data
+        """
+        self.ndim = ndim
+        self.device = device
+        self.split_synth_real = split_synth_real
+        self.labels = np.asarray(folder2files(labels)[subset or slice(None)])
+        self.images = np.asarray(folder2files(images)[subset or slice(None)])
+        # NOTE: array[char] use less RAM that list[str] in multithreads
+        assert len(self.labels) == len(self.images), \
+               "Number of labels and images don't match"
+
+    def __len__(self):
+        n = len(self.images)
+        if self.split_synth_real:
+            n = n//2
+        return n
+
+    def __getitem__(self, idx):
+        lab, img = str(self.labels[idx]), str(self.images[idx])
+
+        lab = LoadTransform(ndim=self.ndim, dtype=torch.long, device=self.device)(lab)
+        img = LoadTransform(ndim=self.ndim, dtype=torch.float32, device=self.device)(img)
+
+        # mean = 0
+        # var = 10
+        # sigma = var ** 0.5
+        # gaussian = torch.from_numpy(np.random.normal(mean, sigma, (img.shape[0], img.shape[1], img.shape[2])))
+        # gaussian = gaussian.float()
+        # img = img + gaussian
+
+        if self.split_synth_real:
+            slab = str(self.labels[len(self)+idx])
+            slab = LoadTransform(ndim=self.ndim, dtype=torch.long, device=self.device)(slab)
+            return slab, img, lab
+        else:
+            return lab, img, lab    
+
+
+# default_folder = '/autofs/cluster/vxmdata1/FS_Slim/proc/cleaned/OAS*/'
+# default_folder = '/autofs/space/durian_001/users/xh999/learn2synth/data'
+default_folder = '/cifs/khan_new/trainees/msalma29/synth_hipp/data'
+
+class PairedDataModule(pl.LightningDataModule):
+
+    def __init__(self,
+                 ndim: int,
+                 images: Optional[Sequence[str]] = None,
+                 labels: Optional[Sequence[str]] = None,
+                 eval: Union[str, slice, List[int], int, float] = 0.2,
+                 test: Union[str, slice, List[int], int, float] = 0.2,
+                 preshuffle: bool = True,
+                 shared: bool = True,
+                 batch_size: int = 64,
+                 shuffle: bool = False,
+                 num_workers: int = 4,
+                 prefetch_factor: int = 2,
+                 ):
+        """
+
+        Parameters
+        ----------
+        ndim : int
+            Number of spatial dimensions
+        images : sequence[str]
+            List of images. By default, use `orig_talairach_slice` from
+            vxmdata1, in folders that have `samseg_23_talairach_slice` labels.
+        labels : sequence[str]
+            List of label maps. By default, use `samseg_23_talairach_slice`
+            from vxmdata1.
+        eval : float
+            Percentage of images to keep for evaluation
+        test : float
+            Percentage of images to keep for test
+        preshuffle : bool
+            Shuffle the image order once (otherwise, sort alphabetically)
+        shared : bool
+            Use the same image for the synth and real loss in each minibatch,
+            Otherwise, use different images.
+        batch_size : int
+            Number of elements in a minibatch
+        shuffle : bool
+            Shuffle file order at each epoch
+        num_workers : int
+            Number of workers in the dataloader
+        prefetch_factor : int
+            Number of batches to load in advance
+        """
+        super().__init__()
+        self.ndim = ndim
+        
+        if labels is None:
+            # Look for .nii.gz files in the labels directory
+            labels = sorted(glob(path.join(default_folder, 'labels', '*.nii.gz')))
+        self.labels = list(labels)
+        
+        if images is None:
+            # Match image files with label files
+            images = []
+            for label in self.labels:
+                # Get the filename without directory
+                label_name = path.basename(label)
+                # Look for matching image in images directory
+                image_path = path.join(path.dirname(path.dirname(label)), 'images', label_name)
+                if path.exists(image_path):
+                    images.append(image_path)
+                else:
+                    print(f"Warning: No matching image found for {label_name}")
+            
+        self.images = list(images)
+        assert len(self.images) == len(self.labels), "Number of images and labels do not match"
+        self.eval = parse_eval(eval)
+        self.test = parse_eval(test)
+        self.preshuffle = preshuffle
+        self.shared = shared
+
+        self.train_kwargs = dict(
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+        )
+        self.eval_kwargs = dict(
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+        )
+
+    def setup(self, stage):
+        images = self.images
+        labels = self.labels
+        if self.preshuffle:
+            image_and_labels = list(zip(images, labels))
+            shuffle(image_and_labels)
+            images = [i for i, _ in image_and_labels]
+            labels = [l for _, l in image_and_labels]
+
+        slice_eval = self.eval
+        if isinstance(slice_eval, float):
+            slice_eval = int(math.ceil(len(images) * slice_eval))
+        slice_test = self.test
+        if isinstance(slice_test, float):
+            slice_test = int(math.ceil(len(images) * slice_test))
+        remaining_images, remaining_labels, \
+        self.test_images, self.test_labels    \
+            = splitset(images, labels, slice_test)
+        self.train_images, self.train_labels, \
+        self.eval_images, self.eval_labels    \
+            = splitset(remaining_images, remaining_labels, slice_eval)
+
+    def train_dataloader(self):
+        train_dataset = PairedDataset(
+            self.ndim, self.train_images, self.train_labels,
+            split_synth_real=not self.shared)
+        return DataLoader(train_dataset, **self.train_kwargs)
+
+    def val_dataloader(self):
+        eval_dataset = PairedDataset(
+            self.ndim, self.eval_images, self.eval_labels,
+            split_synth_real=not self.shared)
+        return DataLoader(eval_dataset, **self.eval_kwargs)
+
+    def test_dataloader(self):
+        test_dataset = PairedDataset(
+            self.ndim, self.test_images, self.test_labels,
+            split_synth_real=not self.shared)
+        return DataLoader(test_dataset, **self.eval_kwargs)
+
+
+def parse_eval(eval):
+    if not isinstance(eval, str):
+        return eval
+    if ':' in eval:
+        eval = eval.split(':')
+        eval = map(literal_eval, eval)
+        eval = slice(*eval)
+    else:
+        try:
+            eval = literal_eval(eval)
+        except ValueError:
+            pass
+    return eval
+
+
+def splitset(images, labels, eval):
+    if isinstance(eval, float):
+        eval = int(math.ceil(len(images) * eval))
+    if isinstance(eval, int):
+        eval = slice(-eval, None)
+    if isinstance(eval, (slice, list, tuple)):
+        eval_images = images[eval]
+        eval_labels = labels[eval]
+    else:
+        eval_images = list(sorted(fnmatch.filter(images, eval)))
+        eval_labels = list(sorted(fnmatch.filter(labels, eval)))
+    images = list(sorted(filter(lambda x: x not in eval_images, images)))
+    labels = list(sorted(filter(lambda x: x not in eval_labels, labels)))
+    return images, labels, eval_images, eval_labels
+
+
+class CLI(LightningCLI):
+    def add_arguments_to_parser(self, parser):
+        parser.add_lightning_class_args(ModelCheckpoint, "checkpoint")
+        parser.set_defaults({
+            "checkpoint.monitor": "eval_loss",
+            "checkpoint.save_last": True,
+            "checkpoint.save_top_k": 5,
+            "checkpoint.every_n_epochs": 10,
+        })
+
+
+if __name__ == '__main__':
+    cli = CLI(Model, PairedDataModule)
+
