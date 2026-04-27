@@ -43,3 +43,6 @@ logs/
 *.h5
 *.pth
 *.pt
+
+
+notebooks/old_versions/
