@@ -119,14 +119,14 @@ class Dice(Metric):
                 pred1 = pred1 * mask
                 ref1 = ref1 * mask
 
-            pred1 = pred1.reshape([len(pred1), -1])           # [B, N]
-            ref1 = ref1.reshape([len(ref1), -1])              # [B, N]
+            pred1 = pred1.reshape([len(pred1), -1])  # [B, N]
+            ref1 = ref1.reshape([len(ref1), -1])  # [B, N]
             hasref = ref1.any(1)
 
             # Compute Dice
-            inter = (pred1 * ref1).sum(-1)                    # [B]
-            pred1 = pred1.sum(-1)                             # [B]
-            ref1 = ref1.sum(-1)                               # [B]
+            inter = (pred1 * ref1).sum(-1)  # [B]
+            pred1 = pred1.sum(-1)  # [B]
+            ref1 = ref1.sum(-1)  # [B]
             union = pred1 + ref1
             loss1 = (2 * inter) / union
             loss1.masked_fill_(~hasref, 0)
@@ -243,7 +243,7 @@ class Hausdorff(Metric):
             loss1 = torch.stack(loss1)
 
             # Mask missing labels
-            ref1 = ref1.reshape([len(ref1), -1])              # [B, N]
+            ref1 = ref1.reshape([len(ref1), -1])  # [B, N]
             hasref = ref1.any(1)
             loss1.masked_fill_(~hasref, 0)
 

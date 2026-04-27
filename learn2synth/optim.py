@@ -10,7 +10,6 @@ from torch.optim import Optimizer as OptimizerBase
 import torch
 import math
 
-
 required = getattr(torch.optim, 'required', None)
 if not required:
     class required:
@@ -75,7 +74,7 @@ class SGD(Optimizer):
                     if momentum is None:
                         momentum = grad.clone()
                     else:
-                        momentum.detach_().copy_(momentum.mul_(mu).add_(grad, alpha=1-tau))
+                        momentum.detach_().copy_(momentum.mul_(mu).add_(grad, alpha=1 - tau))
                     if nes:
                         grad = torch.add(grad, momentum, alpha=mu)
                     else:

@@ -9,44 +9,13 @@ def _dot(x, y):
     return x.unsqueeze(-2).matmul(y.unsqueeze(-1)).squeeze(-1).squeeze(-1)
 
 
-def _make_activation(activation, *, dim=1):
-    """
-    Build an activation module/callable.
-
-    If activation is a string like "Softmax", we instantiate nn.Softmax(dim=dim)
-    to avoid PyTorch's deprecated implicit-dim behavior.
-
-    Parameters
-    ----------
-    activation : str | nn.Module | callable | None
-    dim : int
-        Default dimension used for Softmax/LogSoftmax if needed (segmentation: dim=1)
-    """
-    if activation is None:
-        return None
-
-    # Resolve string -> torch.nn class
+def _make_activation(activation):
     if isinstance(activation, str):
-        activation_cls = getattr(nn, activation)
-
-        # Special-case softmax family: dim must be explicit
-        if activation in ("Softmax", "LogSoftmax"):
-            return activation_cls(dim=dim)
-
-        return activation_cls()
-
-    # If a class (e.g., nn.ReLU), instantiate it
-    if inspect.isclass(activation):
-        # Same special-case if someone passes nn.Softmax class directly
-        if activation in (nn.Softmax, nn.LogSoftmax):
-            return activation(dim=dim)
-        return activation()
-
-    # If already a module instance or function
-    if callable(activation):
-        return activation
-
-    return None
+        activation = getattr(nn, activation)
+    activation = (activation() if inspect.isclass(activation)
+                  else activation if callable(activation)
+    else None)
+    return activation
 
 
 class Loss(nn.Module):
@@ -432,7 +401,9 @@ class CatMSELoss(Loss):
         self.weighted = weighted
         self.labels = labels
         self.reduction = reduction
-        self.activation = _make_activation(activation)
+        if isinstance(activation, str):
+            activation = getattr(nn, activation)
+        self.activation = activation
 
     def forward_onehot(self, pred, ref, mask, weights):
 
@@ -575,7 +546,9 @@ class LogitMSELoss(Loss):
         self.labels = labels
         self.reduction = reduction
         self.target = target
-        self.activation = _make_activation(activation)
+        if isinstance(activation, str):
+            activation = getattr(nn, activation)
+        self.activation = activation
 
     def forward_onehot(self, pred, ref, mask, weights):
 

@@ -50,8 +50,10 @@ class LearnableSynthSeg(nn.Module):
             optim_seg = optim_seg(self.segnet.parameters())
         if callable(optim_synth):
             optim_synth = optim_synth(self.synthnet.parameters())
+
         def optimizers():
             return optim_seg, optim_synth
+
         self.optimizers = optimizers
         return optimizers()
 
@@ -130,7 +132,6 @@ class LearnableSynthSeg(nn.Module):
     def eval_step(self, synth_image_plus, synth_image, synth_ref, real_image, real_ref):
         self.eval()
         with torch.no_grad():
-
             # synth forward
             synth_pred = self.segnet(synth_image)
             synth_loss = self.loss(synth_pred, synth_ref)
@@ -148,7 +149,6 @@ class LearnableSynthSeg(nn.Module):
     def eval_for_plot(self, synth_image_plus, synth_image, synth_ref, real_image, real_ref):
         self.eval()
         with torch.no_grad():
-
             # synth forward
             synth_pred = self.segnet(synth_image)
             synth_loss = self.loss(synth_pred, synth_ref)
@@ -198,8 +198,10 @@ class SynthSeg(nn.Module):
     def configure_optimizers(self, optim):
         if callable(optim):
             optim = optim(self.segnet.parameters())
+
         def optimizers():
             return optim
+
         self.optimizers = optimizers
         return optimizers()
 
@@ -250,7 +252,6 @@ class SynthSeg(nn.Module):
     def eval_step(self, synth_image, synth_ref, real_image, real_ref):
         self.eval()
         with torch.no_grad():
-
             # synth forward
             synth_pred = self.segnet(synth_image)
             synth_loss = self.loss(synth_pred, synth_ref)
@@ -264,7 +265,6 @@ class SynthSeg(nn.Module):
     def eval_for_plot(self, synth_image, synth_ref, real_image, real_ref):
         self.eval()
         with torch.no_grad():
-
             # synth forward
             synth_pred = self.segnet(synth_image)
             synth_loss = self.loss(synth_pred, synth_ref)
@@ -274,4 +274,3 @@ class SynthSeg(nn.Module):
             real_loss = self.loss(real_pred, real_ref)
 
         return synth_loss, real_loss, synth_pred, real_pred
-
