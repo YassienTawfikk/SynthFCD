@@ -8,7 +8,7 @@ of hardcoding values in the script.
 """
 
 # ── Dataset paths ─────────────────────────────────────────────────────────────
-DEFAULT_FOLDER = '/kaggle/input/datasets/yassienmohamed/bonnfcd-supersynth-label-maps/fcd/train'
+DEFAULT_FOLDER = '/kaggle/input/datasets/yassienmohamed/bonnfcd-augmented-supersynth/fcd/train/raw'
 CSV_PATH = '/kaggle/input/datasets/nancyabdelfattah/flair-stats-synthseg/flair_stats_raw_fcd_train.csv'
 
 # ── Per-subject file names ────────────────────────────────────────────────────
