@@ -7,11 +7,9 @@ from scipy.ndimage import zoom as scipy_zoom
 
 
 class FCDParameterCalculator:
-
     # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
-
     def get_subj_num(self, subject_path):
         match = re.search(r'(\d+)', os.path.basename(subject_path))
         return int(match.group(1)) if match else 0
@@ -24,7 +22,6 @@ class FCDParameterCalculator:
     # ------------------------------------------------------------------
     # Per-subject measurements
     # ------------------------------------------------------------------
-
     def calc_intensity_diff(self, flair_arr, roi_mask, label_arr):
         """
         Returns the relative FLAIR contrast of the FCD lesion vs surrounding tissue.
@@ -168,7 +165,6 @@ class FCDParameterCalculator:
     # ------------------------------------------------------------------
     # Range computation helpers
     # ------------------------------------------------------------------
-
     def _compute_intensity_range(self, intensity_diffs):
         """
         Derives a clipped percentile range from relative FLAIR contrasts.

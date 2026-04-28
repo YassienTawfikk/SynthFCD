@@ -863,6 +863,26 @@ class FCDDataset(Dataset):
 
 
 # ── FCDDataModule ─────────────────────────────────────────────────────────────
+#
+#  Source-aware split policy
+#  ─────────────────────────
+#  Training  : raw/ + generated/   (all available subjects)
+#  Validation: raw/ only           (real subjects with ground-truth labels)
+#
+#  The split is enforced structurally — by scanning the two source directories
+#  independently — rather than post-hoc via a fraction, so generated subjects
+#  can never leak into validation regardless of ordering or preshuffle.
+#
+#  `eval` controls what fraction of *raw* subjects are held out for validation.
+#  The remaining raw subjects join training alongside the entire generated pool.
+#
+#  Configurable via constructor flags:
+#    train_subdir      (default "train")       — root under dataset_path
+#    raw_subdir        (default "raw")         — val-eligible subfolder
+#    extra_subdirs     (default ["generated"]) — train-only subfolders
+#    use_extra_data    (default True)          — set False to train on raw only
+#    val_from_raw_only (default True)          — set False to revert to old behaviour
+# ──────────────────────────────────────────────────────────────────────────────
 
 class FCDDataModule(pl.LightningDataModule):
     def __init__(self,
@@ -872,8 +892,15 @@ class FCDDataModule(pl.LightningDataModule):
                  preshuffle: bool = False,
                  batch_size: int = 1,
                  shuffle: bool = True,
-                 num_workers: int = 4):
+                 num_workers: int = 4,
+                 train_subdir: str = 'train',
+                 raw_subdir: Optional[str] = 'raw',
+                 extra_subdirs: Optional[list] = None,
+                 use_extra_data: bool = True,
+                 val_from_raw_only: bool = True):
         super().__init__()
+
+        # --- Config ---
         self.ndim = ndim
         self.dataset_path = dataset_path
         self.eval_frac = eval
@@ -881,43 +908,88 @@ class FCDDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
+        self.use_extra_data = use_extra_data
+        self.val_from_raw_only = val_from_raw_only
 
-        # --- Scan for valid (label, flair, roi) triplets ---
-        subject_folders = sorted(glob.glob(path.join(dataset_path, 'sub-*')))
-        lp_all, fp_all, rp_all = [], [], []
-        for sd in subject_folders:
-            lp = path.join(sd, label_file)
-            fp = path.join(sd, flair_file)
-            rp = path.join(sd, roi_file)
-            if all(path.exists(x) for x in [lp, fp, rp]):
-                lp_all.append(lp)
-                fp_all.append(fp)
-                rp_all.append(rp)
+        # --- Resolve directory layout ---
+        # If raw_subdir is None, data lives directly in train_subdir — no subfolders,
+        # no extra data possible, so use_extra_data is forced False.
+        if raw_subdir is None:
+            self.use_extra_data = False
+            self.val_from_raw_only = False
+            print("[FCDDataModule] raw_subdir=None — scanning train_subdir directly, use_extra_data forced False.")
+        elif extra_subdirs is None:
+            extra_subdirs = ['generated']
 
-        n_subj = len(lp_all)
-        n_folders = len(subject_folders)
+        train_root = path.join(dataset_path, train_subdir)
+        raw_root = train_root if raw_subdir is None else path.join(train_root, raw_subdir)
+        extra_roots = [path.join(train_root, s) for s in extra_subdirs] if extra_subdirs else []
 
-        assert n_subj > 0, (
-            f"[FCDDataModule] Fatal: found 0 valid triplets in {dataset_path}. "
-            "Check your file names and folder structure."
+        # --- Helper: scan one directory for valid (label, flair, roi) triplets ---
+        def _scan(root: str) -> tuple:
+            subject_folders = sorted(glob.glob(path.join(root, 'sub-*')))
+            label_paths, flair_paths, roi_paths = [], [], []
+            dropped = 0
+            for subject_dir in subject_folders:
+                label_path = path.join(subject_dir, label_file)
+                flair_path = path.join(subject_dir, flair_file)
+                roi_path = path.join(subject_dir, roi_file)
+                if all(path.exists(x) for x in [label_path, flair_path, roi_path]):
+                    label_paths.append(label_path)
+                    flair_paths.append(flair_path)
+                    roi_paths.append(roi_path)
+                else:
+                    dropped += 1
+            if dropped:
+                print(f"[FCDDataModule] WARNING: {dropped} incomplete triplets dropped in {root}")
+            else:
+                print(f"[FCDDataModule] {len(label_paths)} subjects loaded from {root}")
+            return label_paths, flair_paths, roi_paths
+
+        # --- Scan raw (val-eligible) subjects ---
+        raw_label_paths, raw_flair_paths, raw_roi_paths = _scan(raw_root)
+        assert len(raw_label_paths) > 0, (
+            f"[FCDDataModule] Fatal: 0 valid triplets in '{raw_root}'. "
+            "Check path and file names."
         )
 
-        if n_subj < n_folders:
-            print(
-                f"[FCDDataModule] WARNING: {n_subj}/{n_folders} subjects have complete triplets "
-                f"— {n_folders - n_subj} dropped due to missing files."
-            )
+        # --- Scan extra (train-only) subjects ---
+        extra_label_paths, extra_flair_paths, extra_roi_paths = [], [], []
+        if not use_extra_data:
+            print("[FCDDataModule] use_extra_data=False — training on raw subjects only.")
         else:
-            print(f"[FCDDataModule] {n_subj} subjects loaded (perfect match).")
+            for extra_root in extra_roots:
+                if path.isdir(extra_root):
+                    e_labels, e_flairs, e_rois = _scan(extra_root)
+                    extra_label_paths.extend(e_labels)
+                    extra_flair_paths.extend(e_flairs)
+                    extra_roi_paths.extend(e_rois)
+                else:
+                    print(f"[FCDDataModule] NOTE: extra subdir not found, skipping: {extra_root}")
 
-        self.label_paths = lp_all
-        self.flair_paths = fp_all
-        self.roi_paths = rp_all
+        # --- Store split-ready pools ---
+        # _raw_*   → split into val (first eval_frac) + train-raw (remainder)
+        # _extra_* → always training only
+        self._raw_label_paths = raw_label_paths
+        self._raw_flair_paths = raw_flair_paths
+        self._raw_roi_paths = raw_roi_paths
 
-        # --- Compute FCD augmentation parameters ---
+        self._extra_label_paths = extra_label_paths
+        self._extra_flair_paths = extra_flair_paths
+        self._extra_roi_paths = extra_roi_paths
+
+        print(
+            f"[FCDDataModule] Source summary: "
+            f"{len(raw_label_paths)} raw, {len(extra_label_paths)} generated "
+            f"→ val pool = raw only ({len(raw_label_paths)} subjects)"
+        )
+
+        # --- Compute FCD augmentation parameters from raw subjects only ---
+        # Generated subjects have synthetic labels that may not reflect the
+        # real intensity statistics expected by FCDParameterCalculator.
         print("[FCDDataModule] Computing FCD augmentation parameters…")
-        self.fcd_int_rng, self.fcd_tl_rng = FCDParameterCalculator().calculate_fcd_parameters(
-            dataset_path=dataset_path,
+        self.fcd_intensity_range, self.fcd_tail_range = FCDParameterCalculator().calculate_fcd_parameters(
+            dataset_path=raw_root,
             label_file=label_file,
             flair_file=flair_file,
             roi_file=roi_file,
@@ -931,39 +1003,58 @@ class FCDDataModule(pl.LightningDataModule):
             return
         self._setup_done = True
 
-        lp, fp, rp = self.label_paths, self.flair_paths, self.roi_paths
-        if self.preshuffle:
-            combined = list(zip(lp, fp, rp))
-            shuffle(combined)
-            lp, fp, rp = map(list, zip(*combined))
+        # Copy raw pool (and shuffle if requested) before splitting
+        raw_label_paths = list(self._raw_label_paths)
+        raw_flair_paths = list(self._raw_flair_paths)
+        raw_roi_paths = list(self._raw_roi_paths)
 
-        n = len(lp)
+        if self.preshuffle:
+            combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths))
+            shuffle(combined)
+            raw_label_paths, raw_flair_paths, raw_roi_paths = map(list, zip(*combined))
 
         def _count(param, total):
             if isinstance(param, float): return int(math.ceil(total * param))
             if isinstance(param, int):   return param
             return 0
 
-        # Clean 2-way split (Train / Val)
-        ne = _count(self.eval_frac, n)
-        eval_lp, eval_fp, eval_rp = lp[:ne], fp[:ne], rp[:ne]
-        train_lp, train_fp, train_rp = lp[ne:], fp[ne:], rp[ne:]
+        # Split raw pool → val head + train tail
+        n_val = _count(self.eval_frac, len(raw_label_paths))
 
-        kw = dict(
-            fcd_intensity_range=self.fcd_int_rng,
-            fcd_tail_length_range=self.fcd_tl_rng,
+        val_label_paths = raw_label_paths[:n_val]
+        val_flair_paths = raw_flair_paths[:n_val]
+        val_roi_paths = raw_roi_paths[:n_val]
+
+        train_raw_label_paths = raw_label_paths[n_val:]
+        train_raw_flair_paths = raw_flair_paths[n_val:]
+        train_raw_roi_paths = raw_roi_paths[n_val:]
+
+        # Training set = remaining raw + all extra (empty list if use_extra_data=False)
+        train_label_paths = train_raw_label_paths + list(self._extra_label_paths)
+        train_flair_paths = train_raw_flair_paths + list(self._extra_flair_paths)
+        train_roi_paths = train_raw_roi_paths + list(self._extra_roi_paths)
+
+        print(
+            f"[FCDDataModule] Split: "
+            f"train={len(train_label_paths)} ({len(train_raw_label_paths)} raw + {len(self._extra_label_paths)} generated), "
+            f"val={len(val_label_paths)} (raw only)"
         )
 
-        self.train_ds = FCDDataset(self.ndim, train_lp, train_fp, train_rp, **kw)
-        self.eval_ds = FCDDataset(self.ndim, eval_lp, eval_fp, eval_rp, **kw)
+        kw = dict(
+            fcd_intensity_range=self.fcd_intensity_range,
+            fcd_tail_length_range=self.fcd_tail_range,
+        )
+
+        self.train_ds = FCDDataset(self.ndim, train_label_paths, train_flair_paths, train_roi_paths, **kw)
+        self.eval_ds = FCDDataset(self.ndim, val_label_paths, val_flair_paths, val_roi_paths, **kw)
 
     def train_dataloader(self):
         return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=self.shuffle, num_workers=self.num_workers, pin_memory=True,
-                          persistent_workers=True if self.num_workers > 0 else False)
+                          persistent_workers=self.num_workers > 0)
 
     def val_dataloader(self):
         return DataLoader(self.eval_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True,
-                          persistent_workers=True if self.num_workers > 0 else False)
+                          persistent_workers=self.num_workers > 0)
 
 
 # ── CLI & Main ────────────────────────────────────────────────────────────────
