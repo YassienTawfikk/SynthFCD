@@ -955,7 +955,7 @@ class FCDDataModule(pl.LightningDataModule):
 
         # --- Scan extra (train-only) subjects ---
         extra_label_paths, extra_flair_paths, extra_roi_paths = [], [], []
-        if not use_extra_data:
+        if not self.use_extra_data:
             print("[FCDDataModule] use_extra_data=False — training on raw subjects only.")
         else:
             for extra_root in extra_roots:

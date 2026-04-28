@@ -14,7 +14,7 @@ CSV_PATH = '/kaggle/input/datasets/nancyabdelfattah/flair-stats-synthseg/flair_s
 # ── Per-subject file names ────────────────────────────────────────────────────
 flair_file = 'flair.nii'
 roi_file = 'roi.nii'
-label_file = 'supersynth.nii'  # 18-class SuperSynth label map (FCD lesion = 21)
+label_file = 'labelmap.nii'  # 18-class SuperSynth label map (FCD lesion = 21)
 fusedmask_file = 'fusedmask.nii'  # kept for backwards compatibility
 
 # ── FCD subject lists by augmentation type ────────────────────────────────────
