@@ -122,7 +122,7 @@ class SharedSynth(torch.nn.Module):
         """
         slab_safe = slab.clone()
         slab_safe[slab_safe == self.FCD_LESION_LBL] = self.CORTEX_LBL
-        slab_safe[(slab_safe < 0) | (slab_safe >= self.N_CLASSES)] = 0
+        slab_safe[(slab_safe < 0) | (slab_safe > self.N_CLASSES)] = 0
         return slab_safe
 
     def _to_one_hot(self, label_map: torch.Tensor) -> torch.Tensor:

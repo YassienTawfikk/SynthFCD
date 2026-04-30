@@ -10,26 +10,25 @@ def donothing(x):
 # FLAIR-like per-class intensity parameters (remapped label space 0–17)
 # ---------------------------------------------------------------------------
 FLAIR_CLASS_PARAMS: dict = {
-    0: {"mu": (0.0, 13.81), "sigma": (1.37, 19.6)},  # Background
-    1: {"mu": (109.84, 223.42), "sigma": (13.84, 36.84)},  # White Matter
-    2: {"mu": (116.44, 209.95), "sigma": (19.78, 47.53)},  # Cortex
-    3: {"mu": (97.5, 225.03), "sigma": (13.94, 39.36)},  # Deep GM / PV
-    4: {"mu": (39.66, 172.89), "sigma": (29.73, 67.62)},  # CSF
-    5: {"mu": (86.69, 223.39), "sigma": (12.96, 53.23)},  # Optic chiasm
-    6: {"mu": (16.81, 101.83), "sigma": (21.09, 84.7)},  # Air Internal
-    7: {"mu": (20.27, 138.59), "sigma": (15.07, 79.41)},  # Artery
-    8: {"mu": (15.14, 160.24), "sigma": (11.79, 58.54)},  # Eye balls
-    9: {"mu": (50.31, 143.43), "sigma": (41.79, 82.53)},  # Other tissues
-    10: {"mu": (87.97, 177.37), "sigma": (26.2, 67.31)},  # Rectus muscles
-    11: {"mu": (66.42, 199.57), "sigma": (26.21, 74.48)},  # Mucosa
-    12: {"mu": (62.25, 152.26), "sigma": (36.28, 79.03)},  # Skin
-    13: {"mu": (16.81, 211.53), "sigma": (7.23, 60.49)},  # Spinal cord
-    14: {"mu": (20.08, 146.72), "sigma": (25.18, 58.34)},  # Vein
-    15: {"mu": (25.22, 133.92), "sigma": (30.2, 67.11)},  # Bone cortical
-    16: {"mu": (61.11, 203.46), "sigma": (34.42, 77.68)},  # Bone cancellous
-    17: {"mu": (71.88, 165.96), "sigma": (20.83, 62.5)},  # Optic nerve
+    0:  {"mu": (  0.0,  13.81), "sigma": ( 1.37, 19.6 )},  # Background
+    1:  {"mu": (109.84, 223.42), "sigma": (13.84, 36.84)},  # White Matter
+    2:  {"mu": (116.44, 209.95), "sigma": (19.78, 47.53)},  # Cortex
+    3:  {"mu": ( 97.5,  225.03), "sigma": (13.94, 39.36)},  # Deep GM / PV
+    4:  {"mu": ( 39.66, 172.89), "sigma": (29.73, 67.62)},  # CSF
+    5:  {"mu": ( 86.69, 223.39), "sigma": (12.96, 53.23)},  # Optic chiasm
+    6:  {"mu": ( 16.81, 101.83), "sigma": (21.09, 84.7 )},  # Air Internal
+    7:  {"mu": ( 20.27, 138.59), "sigma": (15.07, 79.41)},  # Artery
+    8:  {"mu": ( 15.14, 160.24), "sigma": (11.79, 58.54)},  # Eye balls
+    9:  {"mu": ( 50.31, 143.43), "sigma": (41.79, 82.53)},  # Other tissues
+    10: {"mu": ( 87.97, 177.37), "sigma": (26.2,  67.31)},  # Rectus muscles
+    11: {"mu": ( 66.42, 199.57), "sigma": (26.21, 74.48)},  # Mucosa
+    12: {"mu": ( 62.25, 152.26), "sigma": (36.28, 79.03)},  # Skin
+    13: {"mu": ( 16.81, 211.53), "sigma": ( 7.23, 60.49)},  # Spinal cord
+    14: {"mu": ( 20.08, 146.72), "sigma": (25.18, 58.34)},  # Vein
+    15: {"mu": ( 25.22, 133.92), "sigma": (30.2,  67.11)},  # Bone cortical
+    16: {"mu": ( 61.11, 203.46), "sigma": (34.42, 77.68)},  # Bone cancellous
+    17: {"mu": ( 71.88, 165.96), "sigma": (20.83, 62.5 )},  # Optic nerve
 }
-
 
 # ---------------------------------------------------------------------------
 # Load per-subject class params from CSV (produced by extract_flair_stats)
