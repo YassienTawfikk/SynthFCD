@@ -99,15 +99,18 @@ class FCDParameterCalculator:
                                  intensity_subjects=None,
                                  transmantle_subjects=None,
                                  auto_resample=True,
-                                 cortex_labels=[3, 42],
-                                 ventricle_labels=[4, 43],
-                                 wm_labels=[2, 41]):
+                                 cortex_labels=None,
+                                 ventricle_labels=None,
+                                 wm_labels=None):
         """
         Scans the dataset and returns data-driven (intensity_range, tail_length_range)
         tuples. Falls back to clinical defaults if no valid subjects are found.
         """
         intensity_diffs = []
         tail_lengths = []
+        cortex_labels = cortex_labels or [3, 42]
+        ventricle_labels = ventricle_labels or [4, 43]
+        wm_labels = wm_labels or [2, 41]
 
         subject_folders = glob.glob(os.path.join(dataset_path, "*"))
         print(f"[FCD Params] Scanning {len(subject_folders)} folders…")

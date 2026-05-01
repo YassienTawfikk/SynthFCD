@@ -6,6 +6,7 @@ All dataset paths, file names, CSV path, and per-subject augmentation
 type lists live here — import from this module everywhere else instead
 of hardcoding values in the script.
 """
+from learn2synth.custom_cc_synthseg import load_class_params_from_csv
 
 # ── Dataset paths ─────────────────────────────────────────────────────────────
 DEFAULT_FOLDER = '/kaggle/input/datasets/yassienmohamed/bonnfcd-augmented-supersynth/fcd/'
@@ -17,6 +18,11 @@ flair_file = 'flair.nii'
 roi_file = 'roi.nii'
 label_file = 'labelmap.nii'  # 18-class SuperSynth label map (FCD lesion = 21)
 fusedmask_file = 'fusedmask.nii'  # kept for backwards compatibility
+
+
+# ── FLAIR class params — loaded once at import time ────────────────────────
+FLAIR_CLASS_PARAMS = load_class_params_from_csv(FLAIR_CLASS_PARAMS_CSV)
+
 
 # ── FCD subject lists by augmentation type ────────────────────────────────────
 # A subject can appear in multiple lists; FCDDataset joins them with '+'
