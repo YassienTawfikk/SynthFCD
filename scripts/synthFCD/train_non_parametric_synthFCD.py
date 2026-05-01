@@ -1,52 +1,380 @@
 """FCD SynthSeg – 7-class FCD lesion segmentation (background + 5 tissue groups + FCD lesion)."""
-from pathlib import Path
+# ── Standard library ────────────────────────────────────────────────────────
+import os
+import sys
+import glob
+import math
+import random
+import shutil
+import datetime
+import traceback
+from typing import Sequence, Optional
+
+from os import path, makedirs
+from random import shuffle
+
+# ── Third-party libraries ───────────────────────────────────────────────────
+import numpy as np
+import pandas as pd
+import torch
+import matplotlib.pyplot as plt
+import nibabel as nib
+
 import pytorch_lightning as pl
 from pytorch_lightning.cli import LightningCLI
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
-import sys, os, datetime, glob, random, math
-from os import path, makedirs
-from ast import literal_eval
-from random import shuffle
-from typing import Sequence, Optional
 
-import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
-import torch.nn.functional as F
-import nibabel as nib
-from scipy.ndimage import zoom as scipy_zoom
-import cornucopia as cc
-from cornucopia import SynthFromLabelTransform, IntensityTransform
-from cornucopia.special import IdentityTransform
-from monai.transforms import GaussianSmooth
 from torch.utils.data import Dataset, DataLoader
 from torchmetrics.segmentation import DiceScore as dice_compute
 
+import cornucopia as cc
+from cornucopia import SynthFromLabelTransform, IntensityTransform
+from cornucopia.special import IdentityTransform
+
+# NOTE: GaussianSmooth is currently unused → remove if not needed
+# from monai.transforms import GaussianSmooth
+
+
+# ── Project path setup ──────────────────────────────────────────────────────
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_root)
 
+# ── Local modules (learn2synth) ─────────────────────────────────────────────
 from learn2synth.networks import UNet, SegNet
 from learn2synth.train import SynthSeg
-from learn2synth.losses import DiceLoss, LogitMSELoss, CatLoss, CatMSELoss, DiceCELoss, FocalTverskyLoss
+from learn2synth.losses import (
+    DiceLoss, LogitMSELoss, CatLoss, CatMSELoss,
+    DiceCELoss, FocalTverskyLoss,
+)
 from learn2synth import optim
 from learn2synth.parameters import FCDParameterCalculator
 from learn2synth.augmentations import FCDAugmentations
-from learn2synth.custom_cc_synthseg import SynthFromLabelTransform as CustomSynthFromLabelTransform
-from learn2synth.custom_cc_synthseg import load_class_params_from_csv
-from cornucopia import IntensityTransform as CustomIntensityTransform
 
-# ── Configuration & subject lists (single source of truth) ──────────────────
-from learn2synth.configurations import (
-    DEFAULT_FOLDER, FLAIR_STATS_CSV, FLAIR_CLASS_PARAMS_CSV,
-    flair_file, roi_file, label_file,
-    INTENSITY_SUBJECTS, TRANSMANTLE_SUBJECTS,
-    HYPER_SUBJECTS, BLUR_SUBJECTS, THICKENING_SUBJECTS,
+from learn2synth.custom_cc_synthseg import (
+    SynthFromLabelTransform as CustomSynthFromLabelTransform,
 )
 
-# ── FLAIR class params — loaded once at import time ────────────────────────
-FLAIR_CLASS_PARAMS = load_class_params_from_csv(FLAIR_CLASS_PARAMS_CSV)
+# ── Configuration (single source of truth) ──────────────────────────────────
+from learn2synth.configurations import (
+    DEFAULT_FOLDER,
+    OUTPUT_FOLDER,
+    FLAIR_STATS_CSV,
+    FLAIR_CLASS_PARAMS,
+    flair_file,
+    roi_file,
+    label_file,
+    INTENSITY_SUBJECTS,
+    TRANSMANTLE_SUBJECTS,
+    HYPER_SUBJECTS,
+    BLUR_SUBJECTS,
+    THICKENING_SUBJECTS,
+)
+
+
+# ── FCDDataset ────────────────────────────────────────────────────────────────
+# Returns un-augmented volumes plus random augmentation configurations.
+# Actual GPU synthesis happens inside Model.synthesize_batch
+
+class FCDDataset(Dataset):
+    def __init__(
+            self,
+            ndim,
+            label_paths,
+            flair_paths,
+            roi_paths,
+            fcd_intensity_range=(0.1, 0.5),
+            fcd_tail_length_range=(20, 50),
+            blur_sigma_range=(0.7, 1.7),
+            zoom_f_range=(0.2, 0.4),
+            hyper_sigma_range=(0.0, 0.3),
+            trans_sigma_range=(0.0, 0.3)
+    ):
+        """
+        Args:
+            ndim: Dimensions of the input data.
+            label_paths, flair_paths, roi_paths: Paths to the respective NIfTI volumes.
+            fcd_intensity_range: Range for synthetic lesion intensity factors.
+            fcd_tail_length_range: Range for the length of the transmantle tail.
+            blur_sigma_range: Range for Gaussian blur augmentation.
+            zoom_f_range: Range for cortical thickening (zoom) factor.
+            hyper_sigma_range: Range for gray matter hyperintensity noise.
+            trans_sigma_range: Range for transmantle signal intensity noise.
+        """
+        self.ndim = ndim
+        self.fcd_intensity_range = fcd_intensity_range
+        self.fcd_tail_length_range = fcd_tail_length_range
+
+        # Store augmentation hyperparameters for external configurability
+        self.blur_sigma_range = blur_sigma_range
+        self.zoom_f_range = zoom_f_range
+        self.hyper_sigma_range = hyper_sigma_range
+        self.trans_sigma_range = trans_sigma_range
+
+        self.items = []
+
+        # Initialize stateless utility once to minimize instantiation overhead during loading
+        self._calc = FCDParameterCalculator()
+
+        for label_path, flair_path, roi_path in zip(label_paths, flair_paths, roi_paths):
+            subject_num = self._calc.get_subj_num(os.path.dirname(label_path))
+            aug_matches = []
+
+            # Determine specific augmentation types based on subject-specific manifests
+            if subject_num in BLUR_SUBJECTS:        aug_matches.append('blur')
+            if subject_num in THICKENING_SUBJECTS:  aug_matches.append('zoom')
+            if subject_num in HYPER_SUBJECTS:       aug_matches.append('hyper')
+            if subject_num in TRANSMANTLE_SUBJECTS: aug_matches.append('trans')
+
+            aug_type = '+'.join(aug_matches) if aug_matches else 'combo'
+            self.items.append((label_path, flair_path, roi_path, aug_type))
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        label_path, flair_path, roi_path, aug_type = self.items[idx]
+
+        # --- Volume Loading (I/O) ---
+        flair_arr = nib.load(flair_path).get_fdata()
+        label_arr = nib.load(label_path).get_fdata().astype(int)
+        roi_arr = nib.load(roi_path).get_fdata().astype(int)
+
+        # --- Spatial Standardization ---
+        # Resample ROI and labels to match FLAIR space using shared utility instance
+        if flair_arr.shape != roi_arr.shape:
+            roi_arr = (self._calc.resample_to_target(roi_arr, flair_arr.shape, True) > 0.5).astype(int)
+        if flair_arr.shape != label_arr.shape:
+            label_arr = self._calc.resample_to_target(label_arr, flair_arr.shape, True).astype(int)
+
+        # --- Tensor Conversion ---
+        # Data is prepared for the CNN pipeline (C, H, W, D format)
+        label_tensor = torch.as_tensor(label_arr, dtype=torch.int64).unsqueeze(0)
+        flair_tensor = torch.as_tensor(flair_arr, dtype=torch.float32).unsqueeze(0)
+        roi_tensor = torch.as_tensor(roi_arr, dtype=torch.int64).unsqueeze(0)
+
+        # --- Parameter Exposure ---
+        # Construct augmentation parameters from instance ranges.
+        # These are passed as tensors to ensure consistency across worker processes.
+        aug_params = {
+            'int_factor_min': torch.tensor(self.fcd_intensity_range[0], dtype=torch.float32),
+            'int_factor_max': torch.tensor(self.fcd_intensity_range[1], dtype=torch.float32),
+            'tail_length_min': torch.tensor(self.fcd_tail_length_range[0], dtype=torch.long),
+            'tail_length_max': torch.tensor(self.fcd_tail_length_range[1], dtype=torch.long),
+
+            'blur_sigma_min': torch.tensor(self.blur_sigma_range[0], dtype=torch.float32),
+            'blur_sigma_max': torch.tensor(self.blur_sigma_range[1], dtype=torch.float32),
+
+            'zoom_f_min': torch.tensor(self.zoom_f_range[0], dtype=torch.float32),
+            'zoom_f_max': torch.tensor(self.zoom_f_range[1], dtype=torch.float32),
+
+            'hyper_sigma_min': torch.tensor(self.hyper_sigma_range[0], dtype=torch.float32),
+            'hyper_sigma_max': torch.tensor(self.hyper_sigma_range[1], dtype=torch.float32),
+
+            'trans_sigma_min': torch.tensor(self.trans_sigma_range[0], dtype=torch.float32),
+            'trans_sigma_max': torch.tensor(self.trans_sigma_range[1], dtype=torch.float32),
+        }
+
+        return {
+            'label_t': label_tensor,
+            'flair_t': flair_tensor,
+            'roi_t': roi_tensor,
+            'aug_type': aug_type,
+            'subject_id': os.path.basename(os.path.dirname(label_path)),
+            **aug_params,
+        }
+
+# ── FCDDataModule ─────────────────────────────────────────────────────────────
+#
+#  Source-aware split policy
+#  ─────────────────────────
+#  Training  : raw/ + generated/   (all available subjects)
+#  Validation: raw/ only           (real subjects with ground-truth labels)
+#
+#  The split is enforced structurally — by scanning the two source directories
+#  independently — rather than post-hoc via a fraction, so generated subjects
+#  can never leak into validation regardless of ordering or preshuffle.
+#
+#  `eval` controls what fraction of *raw* subjects are held out for validation.
+#  The remaining raw subjects join training alongside the entire generated pool.
+#
+#  Configurable via constructor flags:
+#    train_subdir      (default "train")       — root under dataset_path
+#    raw_subdir        (default "raw")         — val-eligible subfolder
+#    extra_subdirs     (default ["generated"]) — train-only subfolders
+#    use_extra_data    (default False)          — set True to train on raw + extra
+#    val_from_raw_only (default False)          — set True to take validation from raw only
+# ──────────────────────────────────────────────────────────────────────────────
+
+class FCDDataModule(pl.LightningDataModule):
+    def __init__(self,
+                 ndim: int = 3,
+                 dataset_path: str = DEFAULT_FOLDER,
+                 eval: float = 0.04,
+                 preshuffle: bool = False,
+                 batch_size: int = 1,
+                 shuffle: bool = True,
+                 num_workers: int = 4,
+                 train_subdir: str = 'train',
+                 raw_subdir: Optional[str] = 'raw',
+                 extra_subdirs: Optional[list] = None,
+                 use_extra_data: bool = False):
+        super().__init__()
+
+        # --- Config ---
+        self.ndim = ndim
+        self.dataset_path = dataset_path
+        self.eval_frac = eval
+        self.preshuffle = preshuffle
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.num_workers = num_workers
+        self.use_extra_data = use_extra_data
+
+        # --- Resolve directory layout ---
+        # If raw_subdir is None, data lives directly in train_subdir — no subfolders,
+        # no extra data possible, so use_extra_data is forced False.
+        if raw_subdir is None:
+            self.use_extra_data = False
+            self.val_from_raw_only = False
+            print("[FCDDataModule] raw_subdir=None — scanning train_subdir directly, use_extra_data forced False.")
+        elif extra_subdirs is None:
+            extra_subdirs = ['generated']
+
+        train_root = path.join(dataset_path, train_subdir)
+        raw_root = train_root if raw_subdir is None else path.join(train_root, raw_subdir)
+        extra_roots = [path.join(train_root, s) for s in extra_subdirs] if extra_subdirs else []
+
+        # --- Helper: scan one directory for valid (label, flair, roi) triplets ---
+        def _scan(root: str) -> tuple:
+            subject_folders = sorted(glob.glob(path.join(root, 'sub-*')))
+            label_paths, flair_paths, roi_paths = [], [], []
+            dropped = 0
+            for subject_dir in subject_folders:
+                label_path = path.join(subject_dir, label_file)
+                flair_path = path.join(subject_dir, flair_file)
+                roi_path = path.join(subject_dir, roi_file)
+                if all(path.exists(x) for x in [label_path, flair_path, roi_path]):
+                    label_paths.append(label_path)
+                    flair_paths.append(flair_path)
+                    roi_paths.append(roi_path)
+                else:
+                    dropped += 1
+            if dropped:
+                print(f"[FCDDataModule] WARNING: {dropped} incomplete triplets dropped in {root}")
+            else:
+                print(f"[FCDDataModule] {len(label_paths)} subjects loaded from {root}")
+            return label_paths, flair_paths, roi_paths
+
+        # --- Scan raw (val-eligible) subjects ---
+        raw_label_paths, raw_flair_paths, raw_roi_paths = _scan(raw_root)
+        assert len(raw_label_paths) > 0, (
+            f"[FCDDataModule] Fatal: 0 valid triplets in '{raw_root}'. "
+            "Check path and file names."
+        )
+
+        # --- Scan extra (train-only) subjects ---
+        extra_label_paths, extra_flair_paths, extra_roi_paths = [], [], []
+        if not self.use_extra_data:
+            print("[FCDDataModule] use_extra_data=False — training on raw subjects only.")
+        else:
+            for extra_root in extra_roots:
+                if path.isdir(extra_root):
+                    e_labels, e_flairs, e_rois = _scan(extra_root)
+                    extra_label_paths.extend(e_labels)
+                    extra_flair_paths.extend(e_flairs)
+                    extra_roi_paths.extend(e_rois)
+                else:
+                    print(f"[FCDDataModule] NOTE: extra subdir not found, skipping: {extra_root}")
+
+        # --- Store split-ready pools ---
+        # _raw_*   → split into val (first eval_frac) + train-raw (remainder)
+        # _extra_* → always training only
+        self._raw_label_paths = raw_label_paths
+        self._raw_flair_paths = raw_flair_paths
+        self._raw_roi_paths = raw_roi_paths
+
+        self._extra_label_paths = extra_label_paths
+        self._extra_flair_paths = extra_flair_paths
+        self._extra_roi_paths = extra_roi_paths
+
+        print(
+            f"[FCDDataModule] Source summary: "
+            f"{len(raw_label_paths)} raw, {len(extra_label_paths)} generated "
+            f"→ val pool = raw only ({len(raw_label_paths)} subjects)"
+        )
+
+        # --- Compute FCD augmentation parameters from raw subjects only ---
+        # Generated subjects have synthetic labels that may not reflect the
+        # real intensity statistics expected by FCDParameterCalculator.
+        print("[FCDDataModule] Computing FCD augmentation parameters…")
+        self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(
+            dataset_path=raw_root,
+            label_file=label_file,
+            flair_file=flair_file,
+            roi_file=roi_file,
+            intensity_subjects=INTENSITY_SUBJECTS,
+            transmantle_subjects=TRANSMANTLE_SUBJECTS,
+            auto_resample=True,
+        )
+
+    def setup(self, stage=None):
+        if hasattr(self, '_setup_done'):
+            return
+        self._setup_done = True
+
+        # Copy raw pool (and shuffle if requested) before splitting
+        raw_label_paths = list(self._raw_label_paths)
+        raw_flair_paths = list(self._raw_flair_paths)
+        raw_roi_paths = list(self._raw_roi_paths)
+
+        if self.preshuffle:
+            combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths))
+            shuffle(combined)
+            raw_label_paths, raw_flair_paths, raw_roi_paths = map(list, zip(*combined))
+
+        def _count(param, total):
+            if isinstance(param, float): return int(math.ceil(total * param))
+            if isinstance(param, int):   return param
+            return 0
+
+        # Split raw pool → val head + train tail
+        n_val = _count(self.eval_frac, len(raw_label_paths))
+
+        val_label_paths = raw_label_paths[:n_val]
+        val_flair_paths = raw_flair_paths[:n_val]
+        val_roi_paths = raw_roi_paths[:n_val]
+
+        train_raw_label_paths = raw_label_paths[n_val:]
+        train_raw_flair_paths = raw_flair_paths[n_val:]
+        train_raw_roi_paths = raw_roi_paths[n_val:]
+
+        # Training set = remaining raw + all extra (empty list if use_extra_data=False)
+        train_label_paths = train_raw_label_paths + list(self._extra_label_paths)
+        train_flair_paths = train_raw_flair_paths + list(self._extra_flair_paths)
+        train_roi_paths = train_raw_roi_paths + list(self._extra_roi_paths)
+
+        print(
+            f"[FCDDataModule] Split: "
+            f"train={len(train_label_paths)} ({len(train_raw_label_paths)} raw + {len(self._extra_label_paths)} generated), "
+            f"val={len(val_label_paths)} (raw only)"
+        )
+
+        kw = dict(
+            fcd_intensity_range=self.fcd_intensity_range,
+            fcd_tail_length_range=self.fcd_tail_range,
+        )
+
+        self.train_ds = FCDDataset(self.ndim, train_label_paths, train_flair_paths, train_roi_paths, **kw)
+        self.eval_ds = FCDDataset(self.ndim, val_label_paths, val_flair_paths, val_roi_paths, **kw)
+
+    def train_dataloader(self):
+        return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=self.shuffle, num_workers=self.num_workers, pin_memory=True,
+                          persistent_workers=self.num_workers > 0)
+
+    def val_dataloader(self):
+        return DataLoader(self.eval_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True,
+                          persistent_workers=self.num_workers > 0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -74,6 +402,14 @@ class SharedSynth(torch.nn.Module):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def set_class_params(self, params: dict):
+        """Swap the GMM's per-class intensity params (e.g. per-subject stats)."""
+        gmm = getattr(self.synth, 'gmm', None)
+        if gmm is not None and hasattr(gmm, 'class_params'):
+            gmm.class_params = params
+        else:
+            print('[SharedSynth] Warning: set_class_params called but no GMM found.')
 
     def forward(self, slab, img, lab, roi):
         """
@@ -186,7 +522,6 @@ class SharedSynth(torch.nn.Module):
         nb_classes = len(self.target_labels) + 1  # 6: background + 5 tissues
         return torch.clamp(lut[label_map.long()], 0, nb_classes - 1)
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  Model  —  6-class grouped segmentation (brain structures + FCD lesion)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -258,13 +593,40 @@ class Model(pl.LightningModule):
 
     def on_train_start(self):
         # Wire the optimizer getter into SynthSeg so train_step() can call it.
-        # Done once here instead of every training_step.
         self.network.optimizers = self.optimizers
+
+        # ── Model Architecture ────────────────────────────────────────────────
+        seg = self.network.segnet
+        print("\n" + "═" * 60)
+        print("DEBUG: Model Architecture")
+        print("═" * 60)
+        print(f"  Backbone        : UNet")
+        print(f"  seg_features    : {self.hparams.seg_features}")
+        print(f"  seg_nb_levels   : {self.hparams.seg_nb_levels}")
+        print(f"  seg_nb_conv     : {self.hparams.seg_nb_conv}")
+        print(f"  seg_norm        : {self.hparams.seg_norm}")
+        print(f"  nb_classes      : {self.hparams.nb_classes}")
+        print(f"  modality        : '{self.hparams.modality}'")
+        total_params = sum(p.numel() for p in seg.parameters())
+        trainable = sum(p.numel() for p in seg.parameters() if p.requires_grad)
+        print(f"  Total params    : {total_params:,}")
+        print(f"  Trainable params: {trainable:,}")
+
+        # ── Synthesis Pipeline ────────────────────────────────────────────────
+        print("\nDEBUG: Synthesis Pipeline")
+        print("─" * 60)
+        print(f"  SharedSynth.synth type : {type(self.network.synth.synth).__name__}")
+        gmm = getattr(self.network.synth.synth, 'gmm', None)
+        print(f"  GMM type               : {type(gmm).__name__ if gmm else 'None'}")
+        print(f"  GMM class_params keys  : {sorted(gmm.class_params.keys()) if gmm and hasattr(gmm, 'class_params') else 'N/A'}")
+        print(f"  IntensityAug type      : {type(self.intensity_aug).__name__}")
+        print(f"  FCDAugmentations       : {type(self.fcd_aug).__name__}")
+        print(f"  Subject params cached  : {len(self.subject_params_cache)} subjects")
+
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Private builders  (called only from __init__)
     # ══════════════════════════════════════════════════════════════════════════
-
     def _load_subject_params(self) -> dict:
         """Pre-load per-subject GMM parameters from CSV into a lookup cache."""
         cache = {}
@@ -335,7 +697,7 @@ class Model(pl.LightningModule):
 
     def _build_intensity_aug(self, modality: str):
         if modality == 'flair':
-            return CustomIntensityTransform(
+            return IntensityTransform(
                 bias=5, gamma=0.4, motion_fwhm=2, resolution=4,
                 snr=15, gfactor=3, order=3,
             )
@@ -350,15 +712,12 @@ class Model(pl.LightningModule):
 
     def _set_subject_params(self, subject_id: Optional[str]):
         """Swap GMM class_params for the current subject (falls back to global)."""
-        gmm = getattr(getattr(self.network.synth, 'synth', None), 'gmm', None)
-        if gmm is None or not hasattr(gmm, 'class_params'):
-            return
-        gmm.class_params = (
+        params = (
             self.subject_params_cache[subject_id]
             if subject_id and subject_id in self.subject_params_cache
             else FLAIR_CLASS_PARAMS
         )
-
+        self.network.synth.set_class_params(params)
     # ══════════════════════════════════════════════════════════════════════════
     #  Augmentation pipeline
     # ══════════════════════════════════════════════════════════════════════════
@@ -393,7 +752,7 @@ class Model(pl.LightningModule):
         if aug_type in self._saved_aug_types:
             return
         self._saved_aug_types.add(aug_type)
-        save_dir = '/kaggle/working/saved_augs'
+        save_dir = os.path.join(OUTPUT_FOLDER, 'saved_augs')
         os.makedirs(save_dir, exist_ok=True)
         nib.save(
             nib.Nifti1Image(aug_img.detach().cpu().numpy(), np.eye(4)),
@@ -469,6 +828,8 @@ class Model(pl.LightningModule):
                 out = self._process_single_sample(batch, i)
                 if out is not None:
                     results.append(out)
+            if not results:
+                return None
 
         aug_images, aug_masks, real_images, real_masks = zip(*results)
         return (
@@ -487,7 +848,10 @@ class Model(pl.LightningModule):
         if self.trainer.current_epoch % 10 == 0 and batch_idx == 0:
             torch.cuda.empty_cache()
 
-        aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
+        result = self.synthesize_batch(batch)
+        if result is None:
+            return None
+        aug_image, aug_mask, real_image, real_mask = result
 
         loss_synth, loss_real = self.network.train_step(
             aug_image, aug_mask, real_image, real_mask)
@@ -502,7 +866,11 @@ class Model(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         with torch.no_grad():
-            aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
+            result = self.synthesize_batch(batch)
+            if result is None:
+                return None
+            aug_image, aug_mask, real_image, real_mask = result
+
             loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
                 aug_image, aug_mask, real_image, real_mask)
 
@@ -589,35 +957,41 @@ class Model(pl.LightningModule):
         print(f"  DICE FCD (c6) : {dice_fcd:.4f}")
         print(f"{'=' * 40}\n")
 
+        # Log current LR from the scheduler Lightning manages
+        current_lr = self.optimizers().param_groups[0]['lr']
+        print(f'  LR            : {current_lr:.2e}')
+
         self.val_dice.reset()
         self.val_dice_fcd.reset()
 
-        el_metric = self.trainer.callback_metrics.get('eval_loss')
-        if el_metric is not None and hasattr(self, '_scheduler'):
-            self._scheduler.step(
-                el_metric.item() if hasattr(el_metric, 'item') else float(el_metric)
-            )
-            lr = self._scheduler.optimizer.param_groups[0]['lr']
-            print(f'  LR            : {lr:.2e}')
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Optimiser / callbacks / inference
     # ══════════════════════════════════════════════════════════════════════════
 
     def configure_optimizers(self):
-        opt_cls   = getattr(optim, self.optimizer_name)
+        opt_cls = getattr(optim, self.optimizer_name)
         optimizer = opt_cls(self.network.segnet.parameters(),
                             **(self.optimizer_options or {}))
-        self._scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', patience=10, factor=0.5, min_lr=1e-6,
         )
-        return optimizer
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "eval_loss",
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
 
     def configure_callbacks(self):
         return [TimeLimitCallback(self.time_limit_minutes)] if self.time_limit_minutes else []
 
     def forward(self, x):
         return self.network.segnet(x)
+
 
 # ── Helper Functions ──────────────────────────────────────────────────────────
 
@@ -732,7 +1106,6 @@ class LossGraphCallback(Callback):
         except Exception as e:
             print(f"[LossGraph] ❌ Error at epoch {trainer.current_epoch}: "
                   f"{type(e).__name__}: {e}")
-            import traceback;
             traceback.print_exc()
 
 
@@ -763,7 +1136,6 @@ class EveryEpochCheckpointCallback(Callback):
         except Exception as e:
             print(f"[EveryEpoch] ❌ Save FAILED at epoch "
                   f"{trainer.current_epoch}: {type(e).__name__}: {e}")
-            import traceback;
             traceback.print_exc()
 
 
@@ -780,8 +1152,7 @@ class CheckpointTraceCallback(Callback):
         print(f"\n[CKPT TRACE] === Epoch {trainer.current_epoch}: validation starting ===")
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        import shutil
-        _, _, free = shutil.disk_usage('/kaggle/working')
+        _, _, free = shutil.disk_usage(OUTPUT_FOLDER)
         print(f"[CKPT TRACE] Epoch {trainer.current_epoch}: validation hooks running. "
               f"Disk free={free / 1e9:.2f}GB, should_stop={trainer.should_stop}")
 
@@ -812,291 +1183,15 @@ class CheckpointTraceCallback(Callback):
             n_ckpts = len([f for f in os.listdir(ckpt_dir) if f.endswith('.ckpt')])
             print(f"  total ckpt files   : {n_ckpts}")
 
-        import shutil
-        _, _, free = shutil.disk_usage('/kaggle/working')
+        _, _, free = shutil.disk_usage(OUTPUT_FOLDER)
         print(f"  disk free          = {free / 1e9:.2f}GB")
 
     def on_exception(self, trainer, pl_module, exception):
         print(f"\n[CKPT TRACE] ❌ EXCEPTION: {type(exception).__name__}: {exception}")
-        import traceback;
         traceback.print_exc()
 
 
-# ── FCDDataset ────────────────────────────────────────────────────────────────
-# Returns un-augmented volumes plus random augmentation configurations.
-# Actual GPU synthesis happens inside Model.synthesize_batch
-
-class FCDDataset(Dataset):
-    def __init__(self, ndim, label_paths, flair_paths, roi_paths, fcd_intensity_range=(0.1, 0.5), fcd_tail_length_range=(20, 50)):
-        self.ndim = ndim
-        self.fcd_intensity_range = fcd_intensity_range
-        self.fcd_tail_length_range = fcd_tail_length_range
-
-        self.items = []
-        for label_path, flair_path, roi_path in zip(label_paths, flair_paths, roi_paths):
-            subject_num = FCDParameterCalculator().get_subj_num(os.path.dirname(label_path))
-            aug_matches = []
-            if subject_num in BLUR_SUBJECTS:        aug_matches.append('blur')
-            if subject_num in THICKENING_SUBJECTS:  aug_matches.append('zoom')
-            if subject_num in HYPER_SUBJECTS:       aug_matches.append('hyper')
-            if subject_num in TRANSMANTLE_SUBJECTS: aug_matches.append('trans')
-            aug_type = '+'.join(aug_matches) if aug_matches else 'combo'
-            self.items.append((label_path, flair_path, roi_path, aug_type))
-
-    def __len__(self):
-        return len(self.items)
-
-    def __getitem__(self, idx):
-        label_path, flair_path, roi_path, aug_type = self.items[idx]
-
-        # --- Load volumes ---
-        flair_arr = nib.load(flair_path).get_fdata()
-        label_arr = nib.load(label_path).get_fdata().astype(int)
-        roi_arr = nib.load(roi_path).get_fdata().astype(int)
-
-        # --- Resample to FLAIR space if shapes mismatch ---
-        if flair_arr.shape != roi_arr.shape:
-            roi_arr = (FCDParameterCalculator().resample_to_target(roi_arr, flair_arr.shape, True) > 0.5).astype(int)
-        if flair_arr.shape != label_arr.shape:
-            label_arr = FCDParameterCalculator().resample_to_target(label_arr, flair_arr.shape, True).astype(int)
-
-        # --- Convert to tensors ---
-        # ROI is passed through SharedSynth as fused slab; FCD lesion recovered as class 7 after postprocessing.
-        label_tensor = torch.as_tensor(label_arr, dtype=torch.int64).unsqueeze(0)
-        flair_tensor = torch.as_tensor(flair_arr, dtype=torch.float32).unsqueeze(0)
-        roi_tensor = torch.as_tensor(roi_arr, dtype=torch.int64).unsqueeze(0)
-
-        # --- Augmentation parameter ranges (pre-sampled on CPU for clean worker RNG) ---
-        aug_params = {
-            'int_factor_min': torch.tensor(self.fcd_intensity_range[0], dtype=torch.float32),
-            'int_factor_max': torch.tensor(self.fcd_intensity_range[1], dtype=torch.float32),
-            'tail_length_min': torch.tensor(self.fcd_tail_length_range[0], dtype=torch.long),
-            'tail_length_max': torch.tensor(self.fcd_tail_length_range[1], dtype=torch.long),
-            'blur_sigma_min': torch.tensor(0.7, dtype=torch.float32),
-            'blur_sigma_max': torch.tensor(1.7, dtype=torch.float32),
-            'zoom_f_min': torch.tensor(0.2, dtype=torch.float32),
-            'zoom_f_max': torch.tensor(0.4, dtype=torch.float32),
-            'hyper_sigma_min': torch.tensor(0.0, dtype=torch.float32),
-            'hyper_sigma_max': torch.tensor(0.3, dtype=torch.float32),
-            'trans_sigma_min': torch.tensor(0.0, dtype=torch.float32),
-            'trans_sigma_max': torch.tensor(0.3, dtype=torch.float32),
-        }
-
-        return {
-            'label_t': label_tensor,
-            'flair_t': flair_tensor,
-            'roi_t': roi_tensor,
-            'aug_type': aug_type,
-            'subject_id': os.path.basename(os.path.dirname(label_path)),
-            **aug_params,
-        }
-
-
-# ── FCDDataModule ─────────────────────────────────────────────────────────────
-#
-#  Source-aware split policy
-#  ─────────────────────────
-#  Training  : raw/ + generated/   (all available subjects)
-#  Validation: raw/ only           (real subjects with ground-truth labels)
-#
-#  The split is enforced structurally — by scanning the two source directories
-#  independently — rather than post-hoc via a fraction, so generated subjects
-#  can never leak into validation regardless of ordering or preshuffle.
-#
-#  `eval` controls what fraction of *raw* subjects are held out for validation.
-#  The remaining raw subjects join training alongside the entire generated pool.
-#
-#  Configurable via constructor flags:
-#    train_subdir      (default "train")       — root under dataset_path
-#    raw_subdir        (default "raw")         — val-eligible subfolder
-#    extra_subdirs     (default ["generated"]) — train-only subfolders
-#    use_extra_data    (default False)          — set True to train on raw + extra
-#    val_from_raw_only (default False)          — set True to take validation from raw only
-# ──────────────────────────────────────────────────────────────────────────────
-
-class FCDDataModule(pl.LightningDataModule):
-    def __init__(self,
-                 ndim: int = 3,
-                 dataset_path: str = DEFAULT_FOLDER,
-                 eval: float = 0.04,
-                 preshuffle: bool = False,
-                 batch_size: int = 1,
-                 shuffle: bool = True,
-                 num_workers: int = 4,
-                 train_subdir: str = 'train',
-                 raw_subdir: Optional[str] = 'raw',
-                 extra_subdirs: Optional[list] = None,
-                 use_extra_data: bool = False,
-                 val_from_raw_only: bool = False):
-        super().__init__()
-
-        # --- Config ---
-        self.ndim = ndim
-        self.dataset_path = dataset_path
-        self.eval_frac = eval
-        self.preshuffle = preshuffle
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.num_workers = num_workers
-        self.use_extra_data = use_extra_data
-        self.val_from_raw_only = val_from_raw_only
-
-        # --- Resolve directory layout ---
-        # If raw_subdir is None, data lives directly in train_subdir — no subfolders,
-        # no extra data possible, so use_extra_data is forced False.
-        if raw_subdir is None:
-            self.use_extra_data = False
-            self.val_from_raw_only = False
-            print("[FCDDataModule] raw_subdir=None — scanning train_subdir directly, use_extra_data forced False.")
-        elif extra_subdirs is None:
-            extra_subdirs = ['generated']
-
-        train_root = path.join(dataset_path, train_subdir)
-        raw_root = train_root if raw_subdir is None else path.join(train_root, raw_subdir)
-        extra_roots = [path.join(train_root, s) for s in extra_subdirs] if extra_subdirs else []
-
-        # --- Helper: scan one directory for valid (label, flair, roi) triplets ---
-        def _scan(root: str) -> tuple:
-            subject_folders = sorted(glob.glob(path.join(root, 'sub-*')))
-            label_paths, flair_paths, roi_paths = [], [], []
-            dropped = 0
-            for subject_dir in subject_folders:
-                label_path = path.join(subject_dir, label_file)
-                flair_path = path.join(subject_dir, flair_file)
-                roi_path = path.join(subject_dir, roi_file)
-                if all(path.exists(x) for x in [label_path, flair_path, roi_path]):
-                    label_paths.append(label_path)
-                    flair_paths.append(flair_path)
-                    roi_paths.append(roi_path)
-                else:
-                    dropped += 1
-            if dropped:
-                print(f"[FCDDataModule] WARNING: {dropped} incomplete triplets dropped in {root}")
-            else:
-                print(f"[FCDDataModule] {len(label_paths)} subjects loaded from {root}")
-            return label_paths, flair_paths, roi_paths
-
-        # --- Scan raw (val-eligible) subjects ---
-        raw_label_paths, raw_flair_paths, raw_roi_paths = _scan(raw_root)
-        assert len(raw_label_paths) > 0, (
-            f"[FCDDataModule] Fatal: 0 valid triplets in '{raw_root}'. "
-            "Check path and file names."
-        )
-
-        # --- Scan extra (train-only) subjects ---
-        extra_label_paths, extra_flair_paths, extra_roi_paths = [], [], []
-        if not self.use_extra_data:
-            print("[FCDDataModule] use_extra_data=False — training on raw subjects only.")
-        else:
-            for extra_root in extra_roots:
-                if path.isdir(extra_root):
-                    e_labels, e_flairs, e_rois = _scan(extra_root)
-                    extra_label_paths.extend(e_labels)
-                    extra_flair_paths.extend(e_flairs)
-                    extra_roi_paths.extend(e_rois)
-                else:
-                    print(f"[FCDDataModule] NOTE: extra subdir not found, skipping: {extra_root}")
-
-        # --- Store split-ready pools ---
-        # _raw_*   → split into val (first eval_frac) + train-raw (remainder)
-        # _extra_* → always training only
-        self._raw_label_paths = raw_label_paths
-        self._raw_flair_paths = raw_flair_paths
-        self._raw_roi_paths = raw_roi_paths
-
-        self._extra_label_paths = extra_label_paths
-        self._extra_flair_paths = extra_flair_paths
-        self._extra_roi_paths = extra_roi_paths
-
-        print(
-            f"[FCDDataModule] Source summary: "
-            f"{len(raw_label_paths)} raw, {len(extra_label_paths)} generated "
-            f"→ val pool = raw only ({len(raw_label_paths)} subjects)"
-        )
-
-        # --- Compute FCD augmentation parameters from raw subjects only ---
-        # Generated subjects have synthetic labels that may not reflect the
-        # real intensity statistics expected by FCDParameterCalculator.
-        print("[FCDDataModule] Computing FCD augmentation parameters…")
-        self.fcd_intensity_range, self.fcd_tail_range = FCDParameterCalculator().calculate_fcd_parameters(
-            dataset_path=raw_root,
-            label_file=label_file,
-            flair_file=flair_file,
-            roi_file=roi_file,
-            intensity_subjects=INTENSITY_SUBJECTS,
-            transmantle_subjects=TRANSMANTLE_SUBJECTS,
-            auto_resample=True,
-        )
-
-    def setup(self, stage=None):
-        if hasattr(self, '_setup_done'):
-            return
-        self._setup_done = True
-
-        # Copy raw pool (and shuffle if requested) before splitting
-        raw_label_paths = list(self._raw_label_paths)
-        raw_flair_paths = list(self._raw_flair_paths)
-        raw_roi_paths = list(self._raw_roi_paths)
-
-        if self.preshuffle:
-            combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths))
-            shuffle(combined)
-            raw_label_paths, raw_flair_paths, raw_roi_paths = map(list, zip(*combined))
-
-        def _count(param, total):
-            if isinstance(param, float): return int(math.ceil(total * param))
-            if isinstance(param, int):   return param
-            return 0
-
-        # Split raw pool → val head + train tail
-        n_val = _count(self.eval_frac, len(raw_label_paths))
-
-        val_label_paths = raw_label_paths[:n_val]
-        val_flair_paths = raw_flair_paths[:n_val]
-        val_roi_paths = raw_roi_paths[:n_val]
-
-        train_raw_label_paths = raw_label_paths[n_val:]
-        train_raw_flair_paths = raw_flair_paths[n_val:]
-        train_raw_roi_paths = raw_roi_paths[n_val:]
-
-        # Training set = remaining raw + all extra (empty list if use_extra_data=False)
-        train_label_paths = train_raw_label_paths + list(self._extra_label_paths)
-        train_flair_paths = train_raw_flair_paths + list(self._extra_flair_paths)
-        train_roi_paths = train_raw_roi_paths + list(self._extra_roi_paths)
-
-        print(
-            f"[FCDDataModule] Split: "
-            f"train={len(train_label_paths)} ({len(train_raw_label_paths)} raw + {len(self._extra_label_paths)} generated), "
-            f"val={len(val_label_paths)} (raw only)"
-        )
-
-        kw = dict(
-            fcd_intensity_range=self.fcd_intensity_range,
-            fcd_tail_length_range=self.fcd_tail_range,
-        )
-
-        self.train_ds = FCDDataset(self.ndim, train_label_paths, train_flair_paths, train_roi_paths, **kw)
-        self.eval_ds = FCDDataset(self.ndim, val_label_paths, val_flair_paths, val_roi_paths, **kw)
-
-    def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=self.shuffle, num_workers=self.num_workers, pin_memory=True,
-                          persistent_workers=self.num_workers > 0)
-
-    def val_dataloader(self):
-        return DataLoader(self.eval_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True,
-                          persistent_workers=self.num_workers > 0)
-
-
 # ── CLI & Main ────────────────────────────────────────────────────────────────
-
-def parse_eval(val):
-    if not isinstance(val, str):
-        return val
-    try:
-        return literal_eval(val)
-    except Exception:
-        return val
-
 
 class CLI(LightningCLI):
     def add_arguments_to_parser(self, parser):
