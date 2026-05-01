@@ -308,7 +308,8 @@ class FCDDataModule(pl.LightningDataModule):
         # Generated subjects have synthetic labels that may not reflect the
         # real intensity statistics expected by FCDParameterCalculator.
         print("[FCDDataModule] Computing FCD augmentation parameters…")
-        self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(
+        self._calc = FCDParameterCalculator()
+        self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(            
             dataset_path=raw_root,
             label_file=label_file,
             flair_file=flair_file,
