@@ -718,7 +718,8 @@ class Model(pl.LightningModule):
             if subject_id and subject_id in self.subject_params_cache
             else FLAIR_CLASS_PARAMS
         )
-        self.network.synth.set_class_params(params)
+        if self.hparams.modality == 'flair':
+            self.network.synth.set_class_params(params)
     # ══════════════════════════════════════════════════════════════════════════
     #  Augmentation pipeline
     # ══════════════════════════════════════════════════════════════════════════
@@ -1236,6 +1237,7 @@ class CLI(LightningCLI):
         print()
 
         kwargs["default_root_dir"] = save_dir
+        kwargs["enable_progress_bar"] = False        
         kwargs["logger"] = logger
         kwargs["callbacks"] = cbs
         return super().instantiate_trainer(**kwargs)
