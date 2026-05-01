@@ -10,7 +10,7 @@ class FCDAugmentations:
         """
         Separable 3-D Gaussian blur implemented entirely in PyTorch.
         Runs on *device* (GPU or CPU). Returns a (Z,Y,X) float tensor.
-    
+
         Parameters
         ----------
         tensor_3d : torch.Tensor  shape (Z, Y, X)
@@ -58,14 +58,14 @@ class FCDAugmentations:
                                        sigma_range=(0.3, 1.0)):
         """
         Apply random Gaussian blur inside ROI mask – fully GPU-native.
-    
+
         Parameters
         ----------
         synthetic : torch.Tensor  (Z, Y, X)  – lives on GPU
         roi       : torch.Tensor  (Z, Y, X)  – binary / integer mask
         seed      : int, optional
         sigma_range : tuple(float, float)
-    
+
         Returns
         -------
         augmented : torch.Tensor  (Z, Y, X)  – stays on GPU
@@ -89,7 +89,7 @@ class FCDAugmentations:
                              bound='border'):
         """
         Simulate cortical thickening by zooming only the ROI region with random zoom factor.
-    
+
         Parameters
         ----------
         synthetic : torch.Tensor (Z,Y,X)
@@ -156,13 +156,17 @@ class FCDAugmentations:
         gz = 2 * (mz / (Z - 1)) - 1
         grid = torch.stack([gx, gy, gz], dim=-1)[None, ...]
 
-        # Warp ROI region
-        warped = F.grid_sample(img, grid, mode='bilinear',
-                               padding_mode=bound, align_corners=True)
+        # Warp image
+        warped_img = F.grid_sample(img, grid, mode='bilinear',
+                                   padding_mode=bound, align_corners=True)
+        # Warp mask with the SAME grid (nearest-neighbor to keep it binary)
+        warped_mask = F.grid_sample(mask, grid, mode='nearest',
+                                    padding_mode='zeros', align_corners=True)
 
-        # Blend only inside ROI
-        out = img * (1 - mask) + warped * mask
-        return out.squeeze(0).squeeze(0)
+        # Blend: use warped_mask so the boundary follows the zoomed tissue
+        out = img * (1 - warped_mask) + warped_img * warped_mask
+
+        return out.squeeze(0).squeeze(0), warped_mask.squeeze(0).squeeze(0)
 
     def apply_roi_augmentations_hyperintensity(self,
                                                synthetic, roi, seed=None,
@@ -170,7 +174,7 @@ class FCDAugmentations:
                                                ):
         """
         Apply random hyperintensity augmentation to ROI region – fully GPU-native.
-    
+
         Parameters
         ----------
         synthetic       : torch.Tensor  (Z, Y, X)  – lives on GPU
@@ -178,7 +182,7 @@ class FCDAugmentations:
         seed            : int, optional
         intensity_range : tuple(float, float)
         sigma_range     : tuple(float, float)
-    
+
         Returns
         -------
         augmented : torch.Tensor  (Z, Y, X)  – stays on GPU
@@ -213,7 +217,7 @@ class FCDAugmentations:
         """
         Simulate transmantle sign – fully GPU-native.
         Hyperintense tail from cortex ROI toward nearest lateral ventricle (labels 4 / 43).
-    
+
         Parameters
         ----------
         synthetic               : torch.Tensor  (Z, Y, X)  – lives on GPU
