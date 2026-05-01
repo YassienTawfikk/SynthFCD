@@ -177,8 +177,9 @@ class Model(pl.LightningModule):
             optimizer: str = 'Adam',
             optimizer_options: Optional[dict] = None,
             time_limit_minutes: float = None,
-            modality: str = 'flair',
+            modality: str = '',
             csv_path: Optional[str] = CSV_PATH,
+            n_best_batches: int = 2,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -209,6 +210,9 @@ class Model(pl.LightningModule):
         # Manual optimisation
         self.automatic_optimization = False
         self.network.set_backward(self.manual_backward)
+
+        self.n_best_batches = n_best_batches  # Number of best batches to save
+        self._val_batch_cache = []  # Stores (loss, batch_data) tuples
 
     # ══════════════════════════════════════════════════════════════════════
     #  Private builders (called only from __init__)
@@ -338,18 +342,18 @@ class Model(pl.LightningModule):
         """Apply the requested FCD augmentation chain in-place (returns new tensor)."""
         aug = FCDAugmentations()
         for ch in choices:
-            if ch == 'blur':
-                img = aug.apply_roi_augmentations_blured(
-                    img, roi, sigma_range=params['blur_sigma'])
-            elif ch == 'zoom':
+            if ch == 'zoom':
                 img = aug.apply_roi_thickening(
                     img, roi, zoom_range=params['zoom_f'])
             elif ch in ('hyper', 'trans'):
                 img = aug.apply_roi_augmentations_hyperintensity(
                     img, roi,
                     intensity_range=params['int_rng'],
-                    sigma_range=params['hyper_sigma'] if ch == 'hyper' else params['trans_sigma'],
-                )
+                    sigma_range=params['hyper_sigma'] if ch == 'hyper' else params['trans_sigma'], )
+            elif ch == 'blur':
+                img = aug.apply_roi_augmentations_blured(
+                    img, roi, sigma_range=params['blur_sigma'])
+
         return img
 
     def _maybe_save_aug_sample(self, aug_img: torch.Tensor, aug_mask: torch.Tensor,
@@ -478,47 +482,86 @@ class Model(pl.LightningModule):
         # self.log('train_loss_real', loss_real, prog_bar=False)
         return loss
 
+    # def validation_step(self, batch, batch_idx):
+    #     # if batch_idx == 0:
+    #     # Full predictions and diagnostics for first batch only
+    #     with torch.no_grad():
+    #         aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
+    #         loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
+    #             aug_image, aug_mask, real_image, real_mask)
+    #         real_labels = real_mask.squeeze(1)  # Use real_mask you already have
+
+    #     # Convert to CPU and get label indices
+    #     pred_real_cpu = pred_real.cpu()
+    #     real_mask_cpu = real_mask.cpu()
+
+    #     pred_labels = pred_real_cpu.argmax(dim=1)  # [B, H, W, D]
+    #     target_labels = real_mask_cpu.squeeze(1).long()  # [B, H, W, D]
+
+    #     # FIX: Update the CLASS-LEVEL metrics, not a local one
+    #     self.val_dice.update(pred_labels, target_labels)
+    #     self.val_dice_fcd.update(pred_labels, target_labels)
+    #     if batch_idx == 0:
+    #         # Log diagnostics
+    #         self._log_val_diagnostics(pred_synth, pred_labels, aug_image,
+    #                                   real_image, aug_mask, target_labels)
+
+    # loss = loss_synth + self.alpha * loss_real
+    # self.log('eval_loss', loss, prog_bar=True)
+    # return loss
+
+    # else:
+    #     # Lightweight computation for remaining batches
+    #     with torch.no_grad():
+    #         aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
+    #         loss_synth, loss_real = self.network.eval_step(
+    #             aug_image, aug_mask, real_image, real_mask)
+
+    #     loss = loss_synth + self.alpha * loss_real
+    #     self.log('eval_loss', loss, prog_bar=True)
+    #     return loss
     def validation_step(self, batch, batch_idx):
-        # if batch_idx == 0:
-        # Full predictions and diagnostics for first batch only
         with torch.no_grad():
             aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
             loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
                 aug_image, aug_mask, real_image, real_mask)
-            real_labels = real_mask.squeeze(1)  # Use real_mask you already have
+            real_labels = real_mask.squeeze(1)
 
-        # Convert to CPU and get label indices
         pred_real_cpu = pred_real.cpu()
         real_mask_cpu = real_mask.cpu()
+        pred_labels = pred_real_cpu.argmax(dim=1)
+        target_labels = real_mask_cpu.squeeze(1).long()
 
-        pred_labels = pred_real_cpu.argmax(dim=1)  # [B, H, W, D]
-        target_labels = real_mask_cpu.squeeze(1).long()  # [B, H, W, D]
-
-        # FIX: Update the CLASS-LEVEL metrics, not a local one
         self.val_dice.update(pred_labels, target_labels)
         self.val_dice_fcd.update(pred_labels, target_labels)
-        if batch_idx == 0:
-            # Log diagnostics
-            self._log_val_diagnostics(pred_synth, pred_labels, aug_image,
-                                      real_image, aug_mask, target_labels)
 
         loss = loss_synth + self.alpha * loss_real
         self.log('eval_loss', loss, prog_bar=True)
+
+        # Store batch data for potential "best batch" logging
+        # Use negative loss so lower loss = higher priority (or use dice score)
+        batch_score = -loss.item()  # or compute a dice score here
+
+        batch_data = {
+            'pred_synth': pred_synth.cpu(),
+            'pred_labels': pred_labels,
+            'aug_image': aug_image.cpu(),
+            'real_image': real_image.cpu(),
+            'aug_mask': aug_mask.cpu(),
+            'target_labels': target_labels,
+            'score': batch_score,
+            'batch_idx': batch_idx,
+        }
+
+        # Keep only top N batches (sorted by score, highest = best)
+        self._val_batch_cache.append(batch_data)
+        self._val_batch_cache.sort(key=lambda x: x['score'], reverse=True)
+        self._val_batch_cache = self._val_batch_cache[:self.n_best_batches]
+
         return loss
 
-        # else:
-        #     # Lightweight computation for remaining batches
-        #     with torch.no_grad():
-        #         aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
-        #         loss_synth, loss_real = self.network.eval_step(
-        #             aug_image, aug_mask, real_image, real_mask)
-
-        #     loss = loss_synth + self.alpha * loss_real
-        #     self.log('eval_loss', loss, prog_bar=True)
-        #     return loss
-
     def _log_val_diagnostics(self, pred_synth, pred_labels, aug_image,
-                             real_image, aug_mask, real_labels):
+                             real_image, aug_mask, real_labels, suffix=""):
         """Log class-count scalars and save NIfTI samples every 10 epochs."""
         pred_synth_argmax = pred_synth[0].argmax(dim=0)
         pred_real_argmax = pred_labels[0]
@@ -526,23 +569,38 @@ class Model(pl.LightningModule):
         self.log('pred_real_num_classes', float(len(torch.unique(pred_real_argmax))), prog_bar=False)
 
         epoch = self.trainer.current_epoch
-        if epoch % 10 != 0:
+        if epoch % 20 != 0:
             return
 
         base_dir = self.trainer.log_dir or self.trainer.default_root_dir
         img_root = os.path.join(base_dir, 'images')
         makedirs(img_root, exist_ok=True)
-        print(f'\n[Saving] Sample images for Epoch {epoch} to {img_root}...')
+        print(f'\n[Saving] Sample images for Epoch {epoch} {suffix} to {img_root}...')
 
         p = f'{img_root}/epoch-{epoch:04d}'
-        save(pred_synth_argmax, f'{p}_synth-pred.nii.gz')
-        save(pred_real_argmax, f'{p}_real-pred.nii.gz')
-        save(aug_image[0].squeeze(0), f'{p}_synth-image.nii.gz')
-        save(real_image[0].squeeze(0), f'{p}_real-image.nii.gz')
-        save(aug_mask[0].squeeze(0).to(torch.uint8), f'{p}_synth-ref.nii.gz')
-        save(real_labels[0].to(torch.uint8), f'{p}_real-ref.nii.gz')
+        save(pred_synth_argmax, f'{p}_{suffix}_synth-pred.nii.gz')
+        save(pred_real_argmax, f'{p}_{suffix}_real-pred.nii.gz')
+        save(aug_image[0].squeeze(0), f'{p}_{suffix}_synth-image.nii.gz')
+        save(real_image[0].squeeze(0), f'{p}_{suffix}_real-image.nii.gz')
+        save(aug_mask[0].squeeze(0).to(torch.uint8), f'{p}_{suffix}_synth-ref.nii.gz')
+        save(real_labels[0].to(torch.uint8), f'{p}_{suffix}_real-ref.nii.gz')
 
     def on_validation_epoch_end(self):
+        # Log diagnostics for the best N batches
+        for i, batch_data in enumerate(self._val_batch_cache):
+            self._log_val_diagnostics(
+                batch_data['pred_synth'].to(self.device),
+                batch_data['pred_labels'],
+                batch_data['aug_image'].to(self.device),
+                batch_data['real_image'].to(self.device),
+                batch_data['aug_mask'].to(self.device),
+                batch_data['target_labels'],
+                suffix=f"_best{i}_batch{batch_data['batch_idx']}"  # Add suffix to distinguish
+            )
+
+        # Clear cache for next epoch
+        self._val_batch_cache = []
+
         dice_epoch = self.val_dice.compute()
         dice_per_cls = self.val_dice_fcd.compute()
         dice_fcd = dice_per_cls[5] if len(dice_per_cls) > 5 else torch.tensor(0.0)
@@ -880,8 +938,8 @@ class FCDDataset(Dataset):
 #    train_subdir      (default "train")       — root under dataset_path
 #    raw_subdir        (default "raw")         — val-eligible subfolder
 #    extra_subdirs     (default ["generated"]) — train-only subfolders
-#    use_extra_data    (default True)          — set False to train on raw only
-#    val_from_raw_only (default True)          — set False to revert to old behaviour
+#    use_extra_data    (default False)          — set True to train on raw + extra
+#    val_from_raw_only (default False)          — set True to take validation from raw only
 # ──────────────────────────────────────────────────────────────────────────────
 
 class FCDDataModule(pl.LightningDataModule):
@@ -896,8 +954,8 @@ class FCDDataModule(pl.LightningDataModule):
                  train_subdir: str = 'train',
                  raw_subdir: Optional[str] = 'raw',
                  extra_subdirs: Optional[list] = None,
-                 use_extra_data: bool = True,
-                 val_from_raw_only: bool = True):
+                 use_extra_data: bool = False,
+                 val_from_raw_only: bool = False):
         super().__init__()
 
         # --- Config ---
