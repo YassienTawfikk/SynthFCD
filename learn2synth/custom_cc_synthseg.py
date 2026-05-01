@@ -1,148 +1,143 @@
+"""
+custom_cc_synthseg.py
+=====================
+FLAIR-specific GMM synthesis components for the SynthFCD pipeline.
+
+Public API
+----------
+FLAIR_CLASS_PARAMS                  — per-class (μ, σ) ranges for labels 0–18
+load_class_params_from_csv()        — load class params from a CSV file
+RandomGaussianMixtureTransform      — legacy single-range GMM (all classes share one range)
+PerClassGaussianMixtureTransform    — per-class GMM (each class has its own μ/σ range)
+SynthFromLabelTransform             — full synthesis: deform + GMM + intensity
+"""
+
 import torch
 import cornucopia as cc
+import pandas as pd
 
 
 def donothing(x):
     return x
 
 
-# ---------------------------------------------------------------------------
-# FLAIR-like per-class intensity parameters (remapped label space 0–17)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# FLAIR per-class intensity parameters  (label space 0–18)
+# ─────────────────────────────────────────────────────────────────────────────
+
 FLAIR_CLASS_PARAMS: dict = {
-    0:  {"mu": (  0.0,  13.81), "sigma": ( 1.37, 19.6 )},  # Background
+    0:  {"mu": (0.0,    13.81),  "sigma": (1.37,  19.6 )},  # Background
     1:  {"mu": (109.84, 223.42), "sigma": (13.84, 36.84)},  # White Matter
-    2:  {"mu": (116.44, 209.95), "sigma": (19.78, 47.53)},  # Cortex
-    3:  {"mu": ( 97.5,  225.03), "sigma": (13.94, 39.36)},  # Deep GM / PV
-    4:  {"mu": ( 39.66, 172.89), "sigma": (29.73, 67.62)},  # CSF
-    5:  {"mu": ( 86.69, 223.39), "sigma": (12.96, 53.23)},  # Optic chiasm
-    6:  {"mu": ( 16.81, 101.83), "sigma": (21.09, 84.7 )},  # Air Internal
-    7:  {"mu": ( 20.27, 138.59), "sigma": (15.07, 79.41)},  # Artery
-    8:  {"mu": ( 15.14, 160.24), "sigma": (11.79, 58.54)},  # Eye balls
-    9:  {"mu": ( 50.31, 143.43), "sigma": (41.79, 82.53)},  # Other tissues
-    10: {"mu": ( 87.97, 177.37), "sigma": (26.2,  67.31)},  # Rectus muscles
-    11: {"mu": ( 66.42, 199.57), "sigma": (26.21, 74.48)},  # Mucosa
-    12: {"mu": ( 62.25, 152.26), "sigma": (36.28, 79.03)},  # Skin
-    13: {"mu": ( 16.81, 211.53), "sigma": ( 7.23, 60.49)},  # Spinal cord
-    14: {"mu": ( 20.08, 146.72), "sigma": (25.18, 58.34)},  # Vein
-    15: {"mu": ( 25.22, 133.92), "sigma": (30.2,  67.11)},  # Bone cortical
-    16: {"mu": ( 61.11, 203.46), "sigma": (34.42, 77.68)},  # Bone cancellous
-    17: {"mu": ( 71.88, 165.96), "sigma": (20.83, 62.5 )},  # Optic nerve
-    18: {"mu": ( 87.97, 177.37), "sigma": (26.2, 67.31)},   # WM-GM Separator — same range as WM
+    2:  {"mu": (116.44, 209.95), "sigma": (19.78, 47.53)},  # Cerebral Cortex
+    3:  {"mu": (97.5,   225.03), "sigma": (13.94, 39.36)},  # Deep GM / PV
+    4:  {"mu": (39.66,  172.89), "sigma": (29.73, 67.62)},  # CSF
+    5:  {"mu": (86.69,  223.39), "sigma": (12.96, 53.23)},  # Optic chiasm
+    6:  {"mu": (16.81,  101.83), "sigma": (21.09, 84.7 )},  # Air internal
+    7:  {"mu": (20.27,  138.59), "sigma": (15.07, 79.41)},  # Artery
+    8:  {"mu": (15.14,  160.24), "sigma": (11.79, 58.54)},  # Eye balls
+    9:  {"mu": (50.31,  143.43), "sigma": (41.79, 82.53)},  # Other tissues
+    10: {"mu": (87.97,  177.37), "sigma": (26.2,  67.31)},  # Rectus muscles
+    11: {"mu": (66.42,  199.57), "sigma": (26.21, 74.48)},  # Mucosa
+    12: {"mu": (62.25,  152.26), "sigma": (36.28, 79.03)},  # Skin
+    13: {"mu": (16.81,  211.53), "sigma": (7.23,  60.49)},  # Spinal cord
+    14: {"mu": (20.08,  146.72), "sigma": (25.18, 58.34)},  # Vein
+    15: {"mu": (25.22,  133.92), "sigma": (30.2,  67.11)},  # Bone cortical
+    16: {"mu": (61.11,  203.46), "sigma": (34.42, 77.68)},  # Bone cancellous
+    17: {"mu": (71.88,  165.96), "sigma": (20.83, 62.5 )},  # Optic nerve
+    18: {"mu": (87.97,  177.37), "sigma": (26.2,  67.31)},  # WM-GM Separator
 }
 
-# ---------------------------------------------------------------------------
-# Load per-subject class params from CSV (produced by extract_flair_stats)
-# ---------------------------------------------------------------------------
 
-def load_subject_class_params(
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_class_params_from_csv(
         csv_path: str,
-        subject_id: str,
+        class_id_col: str = "class_id",
+        mu_lo_col: str = "mu_lo",
+        mu_hi_col: str = "mu_hi",
+        sigma_lo_col: str = "sigma_lo",
+        sigma_hi_col: str = "sigma_hi",
         fallback: dict | None = None,
 ) -> dict:
-    """Build a per-class GMM parameter dict for one subject from a CSV.
+    """Load per-class GMM intensity parameters from a CSV file.
 
-    Reads ``flair_stats_raw.csv`` (produced by the extract_flair_stats
-    notebook) and returns a dict compatible with
-    :class:`PerClassGaussianMixtureTransform`::
-
-        {class_id: {"mu": (mu_lo, mu_hi), "sigma": (sigma_lo, sigma_hi)}, ...}
+    Missing classes (not present in the CSV) are filled from ``fallback``,
+    which defaults to ``FLAIR_CLASS_PARAMS``. This guarantees all 19 classes
+    (0–18) are always present in the returned dict.
 
     Parameters
     ----------
     csv_path : str
-        Path to ``flair_stats_raw.csv``.
-    subject_id : str
-        Subject folder name as it appears in the CSV ``subject`` column
-        (e.g. ``"sub-00010"``).  Leading/trailing whitespace is ignored.
+        Path to the CSV file.
+    class_id_col, mu_lo_col, mu_hi_col, sigma_lo_col, sigma_hi_col : str
+        Column names for class ID and parameter bounds.
     fallback : dict, optional
-        Dict used for classes absent in the subject's CSV rows.
-        Defaults to the global ``FLAIR_CLASS_PARAMS``.
+        Per-class params used for any class absent in the CSV.
+        Defaults to ``FLAIR_CLASS_PARAMS``.
 
     Returns
     -------
     dict[int, dict]
-        One entry per class (0-17) with ``mu`` and ``sigma`` tuples.
+        ``{class_id: {"mu": (lo, hi), "sigma": (lo, hi)}, ...}``
     """
-    import pandas as pd
-
     if fallback is None:
         fallback = FLAIR_CLASS_PARAMS
 
     df = pd.read_csv(csv_path)
 
-    # Normalise the subject column so name mismatches don't silently fail
-    df["subject"] = df["subject"].astype(str).str.strip()
-    subject_id = str(subject_id).strip()
+    required = {class_id_col, mu_lo_col, mu_hi_col, sigma_lo_col, sigma_hi_col}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"CSV is missing required columns: {missing_cols}")
 
-    sub_df = df[df["subject"] == subject_id]
-    if sub_df.empty:
-        available = df["subject"].unique().tolist()
-        raise ValueError(
-            f"Subject '{subject_id}' not found in {csv_path}. Available subjects (first 10): {available[:10]}"
-        )
-
-    # Required columns (added by the updated extract_flair_stats notebook)
-    required = {"class_id", "mu_lo", "mu_hi", "sigma_lo", "sigma_hi"}
-    missing = required - set(sub_df.columns)
-    if missing:
-        raise ValueError(
-            f"CSV is missing columns: {missing}. Re-run extract_flair_stats_notebook with the updated version that computes per-subject bounds."
-        )
-
-    params: dict = {}
-    for _, row in sub_df.iterrows():
-        cls = int(row["class_id"])
-        params[cls] = {
-            "mu": (float(row["mu_lo"]), float(row["mu_hi"])),
-            "sigma": (float(row["sigma_lo"]), float(row["sigma_hi"])),
+    params = {
+        int(row[class_id_col]): {
+            "mu":    (float(row[mu_lo_col]),    float(row[mu_hi_col])),
+            "sigma": (float(row[sigma_lo_col]), float(row[sigma_hi_col])),
         }
+        for _, row in df.iterrows()
+    }
 
-    # Fill in any classes the subject didn't have enough voxels for
-    all_classes = set(range(18)) | set(fallback.keys())
+    # Fill any classes the CSV didn't cover
+    all_classes = set(range(19)) | set(fallback.keys())
     for cls in all_classes:
-        if cls not in params:
-            params[cls] = fallback.get(cls, {"mu": (0, 255), "sigma": (0, 16)})
+        params.setdefault(cls, fallback.get(cls, {"mu": (0, 255), "sigma": (0, 16)}))
 
-    n_from_csv = len(sub_df)
-    n_from_fallback = len(params) - n_from_csv
-    print(
-        f"[load_subject_class_params] '{subject_id}': {n_from_csv} classes from CSV, {n_from_fallback} filled from fallback."
-    )
     return params
 
 
-# ---------------------------------------------------------------------------
-# Legacy global Gaussian mixture transform
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# GMM transforms
+# ─────────────────────────────────────────────────────────────────────────────
 
 class RandomGaussianMixtureTransform(torch.nn.Module):
-    """Sample from a Gaussian mixture – one range for ALL tissue classes."""
+    """Legacy GMM — samples one shared (μ, σ) range for ALL tissue classes.
+
+    Use ``PerClassGaussianMixtureTransform`` for FLAIR synthesis where each
+    tissue class should have its own intensity distribution.
+    """
 
     def __init__(self, mu=255, sigma=16, fwhm=2, background=None, dtype=None):
         super().__init__()
         self.dtype = dtype
+        self.background = background
         self.sample = dict(
             mu=cc.random.Uniform.make(cc.random.make_range(0, mu)),
             sigma=cc.random.Uniform.make(cc.random.make_range(0, sigma)),
             fwhm=cc.random.Uniform.make(cc.random.make_range(0, fwhm)),
         )
-        self.background = background
-
-    def forward(self, x):
-        theta = self.get_parameters(x)
-        return self.apply_transform(x, theta)
 
     def get_parameters(self, x):
-        mu = self.sample["mu"](len(x))
-        sigma = self.sample["sigma"](len(x))
-        fwhm = int(self.sample["fwhm"]())
-        if x.dtype.is_floating_point:
-            backend = dict(dtype=x.dtype, device=x.device)
-        else:
-            backend = dict(dtype=self.dtype or torch.get_default_dtype(), device=x.device)
-        mu = torch.as_tensor(mu).to(**backend)
-        sigma = torch.as_tensor(sigma).to(**backend)
+        backend = (
+            dict(dtype=x.dtype, device=x.device)
+            if x.dtype.is_floating_point
+            else dict(dtype=self.dtype or torch.get_default_dtype(), device=x.device)
+        )
+        mu    = torch.as_tensor(self.sample["mu"](len(x))).to(**backend)
+        sigma = torch.as_tensor(self.sample["sigma"](len(x))).to(**backend)
+        fwhm  = int(self.sample["fwhm"]())
         return mu, sigma, fwhm
 
     def apply_transform(self, x, parameters):
@@ -153,27 +148,31 @@ class RandomGaussianMixtureTransform(torch.nn.Module):
         y1 = torch.randn(*x.shape, **backend)
         y1 = cc.utils.conv.smoothnd(y1, fwhm=fwhm)
         y1 = y1.mul_(sigma[..., None, None, None]).add_(mu[..., None, None, None])
-        y = torch.sum(x.to(**backend) * y1, dim=0)
-        return y[None]
+        return torch.sum(x.to(**backend) * y1, dim=0)[None]
 
+    def forward(self, x):
+        return self.apply_transform(x, self.get_parameters(x))
 
-# ---------------------------------------------------------------------------
-# Per-class Gaussian mixture transform
-# ---------------------------------------------------------------------------
 
 class PerClassGaussianMixtureTransform(torch.nn.Module):
-    """Each tissue class gets its own (mu_min, mu_max) / (sigma_min, sigma_max).
+    """Per-class GMM — each tissue class has its own (μ_lo, μ_hi) / (σ_lo, σ_hi).
+
+    At each forward call, one scalar (μ, σ) is independently sampled per class
+    from its configured range. The one-hot input mask ensures each voxel picks
+    up the intensity noise of exactly its own tissue class.
 
     Parameters
     ----------
     class_params : dict[int, dict]
-        Mapping from channel index to {"mu": (lo, hi), "sigma": (lo, hi)}.
+        ``{channel_index: {"mu": (lo, hi), "sigma": (lo, hi)}}``.
+        Typically ``FLAIR_CLASS_PARAMS`` or a per-subject variant loaded from CSV.
     fwhm : float
-        Upper bound for within-class smoothing FWHM.
+        Upper bound for within-class spatial smoothing (makes intensities
+        spatially correlated, as in real MRI).
     background : int, optional
-        Channel index to zero out before synthesis.
-    default_mu / default_sigma : tuple
-        Fallback range for channels not listed in class_params.
+        Channel index to zero out before synthesis (suppresses background noise).
+    default_mu, default_sigma : tuple
+        Fallback ranges for channels absent in ``class_params``.
     dtype : torch.dtype, optional
         Output dtype when input is integer.
     """
@@ -188,40 +187,42 @@ class PerClassGaussianMixtureTransform(torch.nn.Module):
             dtype=None,
     ):
         super().__init__()
-        self.class_params = class_params
-        self.default_mu = default_mu
+        self.class_params  = class_params
+        self.default_mu    = default_mu
         self.default_sigma = default_sigma
-        self.background = background
-        self.dtype = dtype
-        self.fwhm_sampler = cc.random.Uniform.make(cc.random.make_range(0, fwhm))
+        self.background    = background
+        self.dtype         = dtype
+        self.fwhm_sampler  = cc.random.Uniform.make(cc.random.make_range(0, fwhm))
 
-    def _sample_scalar(self, lo: float, hi: float) -> float:
+    @staticmethod
+    def _sample_scalar(lo: float, hi: float) -> float:
         if lo >= hi:
             return float(lo)
         return lo + (hi - lo) * torch.rand(1).item()
 
     def get_parameters(self, x):
-        n_classes = len(x)
+        """Sample one (μ, σ) scalar per class channel."""
         mu_vals, sigma_vals = [], []
-        for i in range(n_classes):
-            p = self.class_params.get(i, None)
-            mu_lo, mu_hi = p["mu"] if p else self.default_mu
+        for i in range(len(x)):
+            p = self.class_params.get(i)
+            mu_lo,    mu_hi    = p["mu"]    if p else self.default_mu
             sigma_lo, sigma_hi = p["sigma"] if p else self.default_sigma
             mu_vals.append(self._sample_scalar(mu_lo, mu_hi))
             sigma_vals.append(self._sample_scalar(sigma_lo, sigma_hi))
 
-        fwhm = int(self.fwhm_sampler())
-
-        if x.dtype.is_floating_point:
-            backend = dict(dtype=x.dtype, device=x.device)
-        else:
-            backend = dict(dtype=self.dtype or torch.get_default_dtype(), device=x.device)
-
-        mu = torch.tensor(mu_vals, **backend)
-        sigma = torch.tensor(sigma_vals, **backend)
-        return mu, sigma, fwhm
+        backend = (
+            dict(dtype=x.dtype, device=x.device)
+            if x.dtype.is_floating_point
+            else dict(dtype=self.dtype or torch.get_default_dtype(), device=x.device)
+        )
+        return (
+            torch.tensor(mu_vals,    **backend),
+            torch.tensor(sigma_vals, **backend),
+            int(self.fwhm_sampler()),
+        )
 
     def apply_transform(self, x, parameters):
+        """Apply sampled parameters to the one-hot tensor → synthetic image."""
         mu, sigma, fwhm = parameters
         backend = dict(dtype=mu.dtype, device=x.device)
 
@@ -233,115 +234,133 @@ class PerClassGaussianMixtureTransform(torch.nn.Module):
         if fwhm > 0:
             y1 = cc.utils.conv.smoothnd(y1, fwhm=fwhm)
         y1 = y1.mul_(sigma[..., None, None, None]).add_(mu[..., None, None, None])
-        y = torch.sum(x.to(**backend) * y1, dim=0)
-        return y[None]
+        return torch.sum(x.to(**backend) * y1, dim=0)[None]
 
     def forward(self, x):
-        theta = self.get_parameters(x)
-        return self.apply_transform(x, theta)
+        return self.apply_transform(x, self.get_parameters(x))
 
 
-# ---------------------------------------------------------------------------
-# SynthFromLabelTransform
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Full synthesis transform
+# ─────────────────────────────────────────────────────────────────────────────
 
 class SynthFromLabelTransform(torch.nn.Module):
-    """Synthesize an MRI from an existing one-hot label map.
+    """Synthesize a synthetic MRI from a one-hot label map.
+
+    Pipeline (all three stages are independently configurable):
+
+        one-hot label map
+            │
+            ▼  [1] Geometric deformation  (disabled when no_augs=True)
+            │      RandomAffineElasticTransform — same field applied to x and coreg
+            │
+            ▼  [2] GMM synthesis
+            │      PerClassGaussianMixtureTransform  (default, uses FLAIR_CLASS_PARAMS)
+            │      RandomGaussianMixtureTransform    (fallback when class_params=None)
+            │
+            ▼  [3] Intensity augmentation  (disabled when no_augs=True)
+                   cc.IntensityTransform — bias field, gamma, noise, resolution
+
+    In the FCD training pipeline, ``no_augs=True`` is used so that:
+    - Geometric deformation is handled externally (or skipped).
+    - Intensity augmentation is applied downstream after FCD augmentations.
 
     Parameters
     ----------
+    num_ch : int
+        Number of output image channels (default 1 — single FLAIR channel).
+    no_augs : bool
+        Disable both geometric deformation and intensity augmentation.
     class_params : dict, optional
-        Per-class (mu, sigma) ranges for :class:`PerClassGaussianMixtureTransform`.
-        Defaults to ``None`` → falls back to the legacy global GMM.
+        Per-class GMM params. Pass ``FLAIR_CLASS_PARAMS`` or a per-subject
+        variant. Falls back to the legacy single-range GMM when ``None``.
     use_per_class_gmm : bool
-        When *True* and class_params is provided, use the per-class GMM.
+        When True and class_params is provided, use PerClassGaussianMixtureTransform.
+    skip_gmm : bool
+        Skip GMM entirely — output is the raw intensity-transformed label map.
     """
 
     def __init__(
             self,
-            num_ch=1,
+            num_ch: int = 1,
             patch=None,
-            rotation=15,
-            shears=0.012,
-            zooms=0.15,
-            elastic=0.05,
-            elastic_nodes=10,
-            gmm_fwhm=10,
-            bias=7,
-            gamma=0.6,
-            motion_fwhm=3,
-            resolution=8,
-            snr=10,
-            gfactor=5,
-            order=3,
-            skip_gmm=False,
-            no_augs=False,
+            rotation: float = 15,
+            shears: float = 0.012,
+            zooms: float = 0.15,
+            elastic: float = 0.05,
+            elastic_nodes: int = 10,
+            gmm_fwhm: float = 10,
+            bias: float = 7,
+            gamma: float = 0.6,
+            motion_fwhm: float = 3,
+            resolution: float = 8,
+            snr: float = 10,
+            gfactor: float = 5,
+            order: int = 3,
+            skip_gmm: bool = False,
+            no_augs: bool = False,
             class_params: dict | None = None,
             use_per_class_gmm: bool = True,
     ):
         super().__init__()
         self.no_augs = no_augs
-        self.num_ch = num_ch
+        self.num_ch  = num_ch
 
-        # ---- Geometric deformation ----
+        # ── Geometric deformation ─────────────────────────────────────────────
         self.deform = donothing if no_augs else cc.RandomAffineElasticTransform(
-            elastic,
-            elastic_nodes,
-            order=order,
-            bound="zeros",
-            rotations=rotation,
-            shears=shears,
-            zooms=zooms,
-            patch=patch,
+            elastic, elastic_nodes,
+            order=order, bound="zeros",
+            rotations=rotation, shears=shears, zooms=zooms, patch=patch,
         )
 
-        # ---- GMM ----
+        # ── GMM ───────────────────────────────────────────────────────────────
         if skip_gmm:
             self.gmm = None
         elif use_per_class_gmm and class_params is not None:
             self.gmm = PerClassGaussianMixtureTransform(
-                class_params=class_params,
-                fwhm=gmm_fwhm,
-                background=0,
+                class_params=class_params, fwhm=gmm_fwhm, background=0,
             )
         else:
             self.gmm = RandomGaussianMixtureTransform(fwhm=gmm_fwhm, background=0)
 
-        # ---- Post-GMM intensity augmentations ----
+        # ── Post-GMM intensity augmentation ───────────────────────────────────
         self.intensity = donothing if no_augs else cc.IntensityTransform(
-            bias, gamma, motion_fwhm, resolution, snr, gfactor, order
+            bias, gamma, motion_fwhm, resolution, snr, gfactor, order,
         )
 
-    # ------------------------------------------------------------------
-    def forward(self, x, coreg=None):
+    def forward(self, x: torch.Tensor, coreg=None):
         """
         Parameters
         ----------
-        x : Tensor (n_classes, H, W, D)  – one-hot label map
+        x : Tensor (n_classes, D, H, W)
+            One-hot label map. n_classes = N_CLASSES + 1 = 19 for labels 0–18.
         coreg : Tensor or list[Tensor], optional
-            Extra volumes that must be co-deformed with x (e.g. FCD mask).
+            Extra volumes co-deformed with x (e.g. real FLAIR, label map, ROI).
+            Passed through unchanged when no_augs=True.
 
         Returns
         -------
-        img  : Tensor (1, H, W, D)         – synthetic FLAIR
-        lab  : Tensor (n_classes, H, W, D) – (deformed) label map
-        coreg: Tensor or list[Tensor]       – only returned when coreg is not None
+        img   : Tensor (1, D, H, W)          — synthetic FLAIR image
+        x     : Tensor (n_classes, D, H, W)  — (deformed) one-hot label map
+        coreg : Tensor or list[Tensor]        — only when coreg was provided
         """
-        # 1. Geometric deformation
-        #    Stack x + coreg so they all receive the SAME random field.
+        # ── Stage 1: Geometric deformation ───────────────────────────────────
+        # Stack x + coreg into one tensor so a single deform call applies the
+        # same random field to everything simultaneously, then split back out.
         if not self.no_augs:
             if coreg is not None:
-                coreg_list = list(coreg) if isinstance(coreg, (list, tuple)) else [coreg]
-                n_lab = x.shape[0]
-                stacked = torch.cat([x] + coreg_list, dim=0)
-                stacked = self.deform(stacked)
-                x = stacked[:n_lab]
-                deformed_co = [stacked[n_lab + i] for i in range(len(coreg_list))]
-                coreg = deformed_co if isinstance(coreg, (list, tuple)) else deformed_co[0]
+                coreg_list = coreg if isinstance(coreg, (list, tuple)) else [coreg]
+                n_lab      = x.shape[0]
+                stacked    = torch.cat([x] + coreg_list, dim=0)
+                stacked    = self.deform(stacked)
+                x          = stacked[:n_lab]
+                coreg      = [stacked[n_lab + i] for i in range(len(coreg_list))]
+                if not isinstance(coreg, (list, tuple)):
+                    coreg = coreg[0]
             else:
                 x = self.deform(x)
 
-        # 2. GMM synthesis
+        # ── Stage 2: GMM synthesis ────────────────────────────────────────────
         if self.gmm is not None:
             gmm_params = [self.gmm.get_parameters(x) for _ in range(self.num_ch)]
             img = torch.cat(
@@ -352,96 +371,7 @@ class SynthFromLabelTransform(torch.nn.Module):
         else:
             img = self.intensity(x)
 
+        # ── Return ────────────────────────────────────────────────────────────
         if coreg is not None:
             return img, x, coreg
         return img, x
-
-
-# ---------------------------------------------------------------------------
-# CCSynthSeg – dictionary-transform wrapper
-# ---------------------------------------------------------------------------
-
-class CCSynthSeg:
-    """MONAI-style dict transform wrapping :class:`SynthFromLabelTransform`.
-
-    Defaults to the FLAIR intensity preset (:data:`FLAIR_CLASS_PARAMS`).
-    Pass ``use_per_class_gmm=False`` to revert to the legacy global GMM.
-    """
-
-    def __init__(
-            self,
-            label_key,
-            image_key="image",
-            coreg_keys=None,
-            num_ch=1,
-            patch=None,
-            rotation=15,
-            shears=0.012,
-            zooms=0.15,
-            elastic=0.05,
-            elastic_nodes=10,
-            gmm_fwhm=10,
-            bias=7,
-            gamma=0.6,
-            motion_fwhm=3,
-            resolution=8,
-            snr=10,
-            gfactor=5,
-            order=3,
-            skip_gmm=False,
-            no_augs=False,
-            class_params: dict | None = None,
-            use_per_class_gmm: bool = True,
-    ) -> None:
-        self.label_key = label_key
-        self.image_key = image_key
-        self.coreg_keys = (
-            coreg_keys if isinstance(coreg_keys, (tuple, list)) else [coreg_keys]
-        )
-
-        if class_params is None and use_per_class_gmm:
-            class_params = FLAIR_CLASS_PARAMS
-
-        self.transform = SynthFromLabelTransform(
-            num_ch=num_ch,
-            patch=patch,
-            rotation=rotation,
-            shears=shears,
-            zooms=zooms,
-            elastic=elastic,
-            elastic_nodes=elastic_nodes,
-            gmm_fwhm=gmm_fwhm,
-            bias=bias,
-            gamma=gamma,
-            motion_fwhm=motion_fwhm,
-            resolution=resolution,
-            snr=snr,
-            gfactor=gfactor,
-            order=order,
-            skip_gmm=skip_gmm,
-            no_augs=no_augs,
-            class_params=class_params,
-            use_per_class_gmm=use_per_class_gmm,
-        )
-
-    def __call__(self, data):
-        d = dict(data)
-        result = self.transform(
-            d[self.label_key],
-            [d[key] for key in self.coreg_keys] if self.coreg_keys is not None else None,
-        )
-        if len(result) == 3:
-            img, lab, coreg = result
-        else:
-            img, lab = result
-            coreg = None
-
-        d[self.image_key] = img
-        d[self.label_key] = lab
-        if self.label_key + "_meta_dict" in d:
-            d[self.image_key + "_meta_dict"] = d[self.label_key + "_meta_dict"]
-        if coreg is not None:
-            for i, key in enumerate(self.coreg_keys):
-                d[key] = coreg[i] if isinstance(coreg, list) else coreg
-        d["mpm"] = torch.zeros_like(img)
-        return d
