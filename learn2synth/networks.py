@@ -1,42 +1,14 @@
 from . import modules, utils
 from torch import nn
-
-
-def _init_from_defaults(self, **kwargs):
-    for key, value in self.defaults.__dict__.items():
-        if key[0] != '_':
-            kwargs.setdefault(key, value)
-    for key, value in kwargs.items():
-        setattr(self, key, value)
+from typing import Sequence
 
 
 class SegNet(nn.Sequential):
-    """
-    A generic segmentation network that works with any backbone
-    """
+    """A generic segmentation network that works with any backbone."""
 
     def __init__(self, ndim, in_channels, out_channels,
                  kernel_size=3, activation='Softmax',
                  backbone='UNet', kwargs_backbone=None):
-        """
-
-        Parameters
-        ----------
-        ndim : {2, 3}
-            Number of spatial dimensions
-        in_channels : int
-            Number of input channels
-        out_channels : int
-            Number of output classes
-        kernel_size : int, default=3
-            Kernel size of the initial feature extraction layer
-        activation : str or None, default='softmax'
-            Final activation function
-        backbone : {'UNet', 'MeshNet', 'ATrousNet'} or Module, default='UNet'
-            Generic backbone module. Can be already instantiated.
-        kwargs_backbone : dict, optional
-            Parameters of the backbone (if backbone is not pre-instantiated)
-        """
         if isinstance(backbone, str):
             backbone_kls = globals()[backbone]
             backbone = backbone_kls(ndim, **(kwargs_backbone or {}))
@@ -54,7 +26,7 @@ class SegNet(nn.Sequential):
 
 
 class UNet(nn.Module):
-    """A highly parameterized U-Net (encoder-decoder + skip connections)
+    """A highly parameterized U-Net (encoder-decoder + skip connections).
 
     conv ------------------------------------------(+)-> conv
          -down-> conv ---------------(+)-> conv -> up
@@ -68,65 +40,39 @@ class UNet(nn.Module):
     https://arxiv.org/abs/1505.04597
     """
 
-    class defaults:
-        nb_levels = 6  # number of levels
-        nb_features = (16, 24, 32, 48, 64, 96, 128, 192, 256, 320)
-        nb_conv = 2  # number of convolutions per level
-        kernel_size = 3  # kernel size
-        activation = 'ReLU'  # activation function
-        norm = 'instance'  # 'batch', 'instance', 'layer', None
-        dropout = 0  # dropout probability
-        residual = False  # use residual connections throughout
-        factor = 2  # change resolution by this factor
-        use_strides = False  # use strided conv instead of linear resize
-        order = 'cand'  # c[onv], a[ctivation], n[orm], d[ropout]
-        combine = 'cat'  # 'cat', 'add'
-
-    def _feat_block(self, i, o=None):
-        opt = dict(activation=None, kernel_size=self.kernel_size,
-                   order=self.order, residual=self.residual)
-        return modules.ConvBlock(self.ndim, i, o, **opt)
-
-    def _conv_block(self, i, o=None):
-        opt = dict(activation=self.activation, kernel_size=self.kernel_size,
-                   order=self.order, nb_conv=self.nb_conv, norm=self.norm,
-                   residual=self.residual, dropout=self.dropout)
-        return modules.ConvGroup(self.ndim, i, o, **opt)
-
-    def _down_block(self, i, o=None):
-        if self.use_strides:
-            opt = dict(activation=self.activation, strides=self.factor,
-                       order=self.order, kernel_size=self.factor,
-                       norm=self.norm, dropout=self.dropout)
-            return modules.StridedConvBlockDown(self.ndim, i, o, **opt)
-        else:
-            opt = dict(activation=self.activation, factor=self.factor,
-                       order=self.order, kernel_size=1,
-                       norm=self.norm, dropout=self.dropout)
-            return modules.ConvBlockDown(self.ndim, i, o, **opt)
-
-    def _up_block(self, i, o=None):
-        if self.use_strides:
-            opt = dict(activation=self.activation, strides=self.factor,
-                       order=self.order, kernel_size=self.factor,
-                       norm=self.norm, dropout=self.dropout,
-                       combine=self.combine)
-            return modules.StridedConvBlockUp(self.ndim, i, o, **opt)
-        else:
-            opt = dict(activation=self.activation, factor=self.factor,
-                       order=self.order, kernel_size=1,
-                       norm=self.norm, dropout=self.dropout,
-                       combine=self.combine)
-            return modules.ConvBlockUp(self.ndim, i, o, **opt)
-
-    def __init__(self, ndim, **kwargs):
+    def __init__(
+            self,
+            ndim: int,
+            nb_features: Sequence[int] = (16, 24, 32, 48, 64, 96, 128, 192, 256, 320),
+            nb_levels: int = 6,
+            nb_conv: int = 2,
+            kernel_size: int = 3,
+            activation: str = 'ReLU',
+            norm: str = 'instance',
+            dropout: float = 0,
+            residual: bool = False,
+            factor: int = 2,
+            use_strides: bool = False,
+            order: str = 'cand',
+            combine: str = 'cat',
+    ):
         super().__init__()
-        _init_from_defaults(self, **kwargs)
         self.ndim = ndim
-        self.nb_features = utils.ensure_list(self.nb_features, self.nb_levels)
+        self.nb_features = list(utils.ensure_list(nb_features, nb_levels))
+        self.nb_levels = nb_levels
+        self.nb_conv = nb_conv
+        self.kernel_size = kernel_size
+        self.activation = activation
+        self.norm = norm
+        self.dropout = dropout
+        self.residual = residual
+        self.factor = factor
+        self.use_strides = use_strides
+        self.order = order
+        self.combine = combine
         self.in_channels = self.out_channels = self.nb_features[0]
 
-        # encoder
+        # ── Encoder ───────────────────────────────────────────────────────────
         i, o = self.nb_features[0], self.nb_features[0]
         self.encoder = [self._conv_block(i, o)]
         for n in range(1, len(self.nb_features) - 1):
@@ -138,7 +84,7 @@ class UNet(nn.Module):
             self.encoder += [self._down_block(i, o)]
         self.encoder = nn.Sequential(*self.encoder)
 
-        # decoder
+        # ── Decoder ───────────────────────────────────────────────────────────
         self.decoder = []
         for n in range(len(self.nb_features) - 1):
             i, o = self.nb_features[-n - 1], self.nb_features[-n - 2]
@@ -153,27 +99,74 @@ class UNet(nn.Module):
         self.decoder += [self._conv_block(i, o)]
         self.decoder = nn.Sequential(*self.decoder)
 
+    # ── Builder helpers ───────────────────────────────────────────────────────
+
+    def _conv_block(self, i, o=None):
+        return modules.ConvGroup(self.ndim, i, o,
+                                 activation=self.activation,
+                                 kernel_size=self.kernel_size,
+                                 order=self.order,
+                                 nb_conv=self.nb_conv,
+                                 norm=self.norm,
+                                 residual=self.residual,
+                                 dropout=self.dropout)
+
+    def _down_block(self, i, o=None):
+        if self.use_strides:
+            return modules.StridedConvBlockDown(self.ndim, i, o,
+                                                activation=self.activation,
+                                                strides=self.factor,
+                                                order=self.order,
+                                                kernel_size=self.factor,
+                                                norm=self.norm,
+                                                dropout=self.dropout)
+        return modules.ConvBlockDown(self.ndim, i, o,
+                                     activation=self.activation,
+                                     factor=self.factor,
+                                     order=self.order,
+                                     kernel_size=1,
+                                     norm=self.norm,
+                                     dropout=self.dropout)
+
+    def _up_block(self, i, o=None):
+        if self.use_strides:
+            return modules.StridedConvBlockUp(self.ndim, i, o,
+                                              activation=self.activation,
+                                              strides=self.factor,
+                                              order=self.order,
+                                              kernel_size=self.factor,
+                                              norm=self.norm,
+                                              dropout=self.dropout,
+                                              combine=self.combine)
+        return modules.ConvBlockUp(self.ndim, i, o,
+                                   activation=self.activation,
+                                   factor=self.factor,
+                                   order=self.order,
+                                   kernel_size=1,
+                                   norm=self.norm,
+                                   dropout=self.dropout,
+                                   combine=self.combine)
+
+    # ── Forward ───────────────────────────────────────────────────────────────
+
     def forward(self, x):
-        # check shape
         nb_levels = len(self.encoder)
         if any(s < 2 ** nb_levels for s in x.shape[2:]):
-            raise ValueError(f'UNet with {nb_levels} levels requires input '
-                             f'shape larger or equal to {2 ** nb_levels}, but '
-                             f'got {list(x.shape[2:])}')
+            raise ValueError(
+                f'UNet with {nb_levels} levels requires spatial dimensions '
+                f'>= {2 ** nb_levels}, got {list(x.shape[2:])}'
+            )
 
-        # compute downstream pyramid
+        # Encoder — build skip connections
         skips = []
         for layer in self.encoder:
             x = layer(x)
             skips.append(x)
 
-        # compute upstream pyramid
+        # Decoder — upsample + merge skips
         x = skips.pop(-1)
         for n in range(len(self.decoder) - 1):
             x = self.decoder[n].conv(x)
             x = self.decoder[n].up(x, skips.pop(-1))
 
-        # highest resolution
-        x = self.decoder[-1](x)
-
-        return x
+        return self.decoder[-1](x)

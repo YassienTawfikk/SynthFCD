@@ -9,7 +9,8 @@ of hardcoding values in the script.
 
 # ── Dataset paths ─────────────────────────────────────────────────────────────
 DEFAULT_FOLDER = '/kaggle/input/datasets/yassienmohamed/bonnfcd-augmented-supersynth/fcd/'
-CSV_PATH = '/kaggle/input/datasets/nancyabdelfattah/flair-stats-synthseg/flair_stats_raw_fcd_train.csv'
+FLAIR_CLASS_PARAMS_CSV = '/kaggle/input/datasets/nancyabdelfattah/flair-stats-synthseg/flair_class_params_fcd_train.csv'
+FLAIR_STATS_CSV = '/kaggle/input/datasets/nancyabdelfattah/flair-stats-synthseg/flair_stats_raw_fcd_train.csv'
 
 # ── Per-subject file names ────────────────────────────────────────────────────
 flair_file = 'flair.nii'

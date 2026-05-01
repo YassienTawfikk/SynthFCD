@@ -1,7 +1,7 @@
 class_id,class_name,n_subjects,mu_lo,mu_hi,sigma_lo,sigma_hi,mean_of_means,mean_of_stds
 0,Background,85,0.0,6.86,1.01,19.15,1.36,3.29
 1,White Matter,85,96.74,167.86,13.87,25.57,135.74,18.51
-2,Cortex,85,119.49,207.74,21.98,43.51,167.0,29.43
+2,Cortex,85,120.88,208.33,22.94,47.17,168.21,31.66
 3,Deep GM / PV,85,115.86,202.55,21.81,40.71,166.6,30.3
 4,CSF,85,46.46,95.13,41.37,71.33,65.94,55.71
 5,Optic chiasm,85,104.92,218.29,26.08,63.95,172.07,37.91
@@ -17,3 +17,4 @@ class_id,class_name,n_subjects,mu_lo,mu_hi,sigma_lo,sigma_hi,mean_of_means,mean_
 15,Bone cortical,85,20.24,65.02,29.44,63.19,38.19,42.44
 16,Bone cancellous,85,48.31,162.52,39.09,84.92,98.23,61.22
 17,Optic nerve,85,65.07,150.17,23.74,70.06,103.33,43.91
+18,WM - GM Separator,85,114.66,206.06,16.12,28.84,162.94,21.7
