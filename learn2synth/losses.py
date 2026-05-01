@@ -697,9 +697,7 @@ class DiceCELoss(Loss):
         (e.g., 'Softmax').
     """
 
-    def __init__(self, lambda_dice=1.0, lambda_ce=1.0, square=True,
-                 weighted=False, labels=None, eps=None, reduction='mean',
-                 activation=None):
+    def __init__(self, lambda_dice=1.0, lambda_ce=1.0, square=True, weighted=False, labels=None, eps=None, reduction='mean', activation=None):
         super().__init__(reduction)
         self.lambda_dice = lambda_dice
         self.lambda_ce = lambda_ce
