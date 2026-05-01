@@ -34,15 +34,19 @@ from learn2synth import optim
 from learn2synth.parameters import FCDParameterCalculator
 from learn2synth.augmentations import FCDAugmentations
 from learn2synth.custom_cc_synthseg import SynthFromLabelTransform as CustomSynthFromLabelTransform
+from learn2synth.custom_cc_synthseg import load_class_params_from_csv
 from cornucopia import IntensityTransform as CustomIntensityTransform
 
 # ── Configuration & subject lists (single source of truth) ──────────────────
 from learn2synth.configurations import (
-    DEFAULT_FOLDER, CSV_PATH,
+    DEFAULT_FOLDER, FLAIR_STATS_CSV, FLAIR_CLASS_PARAMS_CSV,
     flair_file, roi_file, label_file,
     INTENSITY_SUBJECTS, TRANSMANTLE_SUBJECTS,
     HYPER_SUBJECTS, BLUR_SUBJECTS, THICKENING_SUBJECTS,
 )
+
+# ── FLAIR class params — loaded once at import time ────────────────────────
+FLAIR_CLASS_PARAMS = load_class_params_from_csv(FLAIR_CLASS_PARAMS_CSV)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -51,16 +55,16 @@ from learn2synth.configurations import (
 
 class SharedSynth(torch.nn.Module):
     """
-    Applies the same geometric deformation to both the synthetic branch
-    (label → image) and the real branch (FLAIR + ROI).
+    GMM synthesis + label remapping for the FCD segmentation pipeline.
 
-    IntensityTransform is intentionally bypassed here — it is applied
-    downstream after FCD augmentations.
+    Synthetic branch: label map → one-hot → GMM → synthetic FLAIR image
+    Real branch:      FLAIR + label + ROI passed through unchanged (no_augs=True)
+
+    Geometric deformation is disabled (no_augs=True in CustomSynthFromLabelTransform).
+    IntensityTransform is intentionally excluded — applied downstream after FCD augmentations.
     """
 
-    N_CLASSES = 18
-    FCD_LESION_LBL = 21
-    CORTEX_LBL = 2
+    N_CLASSES = 18  # valid labels are 0..18 inclusive (19 values)
 
     def __init__(self, synth, target_labels=None):
         super().__init__()
@@ -72,19 +76,41 @@ class SharedSynth(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, slab, img, lab, roi):
-        img = img.float() if img.is_floating_point() else img
+        """
+        Parameters
+        ----------
+        slab : (1, D, H, W) int64   — label map 0..18, used for GMM synthesis
+        img  : (1, D, H, W) float32 — real FLAIR, passed through to real branch
+        lab  : (1, D, H, W) int64   — real label map, passed through to real branch
+        roi  : (1, D, H, W) int64   — binary ROI mask, passed through to real branch
 
+        Returns
+        -------
+        simg     : (1, D, H, W) float32  — synthetic FLAIR from GMM
+        slab_out : (1, D, H, W) int64    — remapped label map {0..5}
+        rimg     : (1, D, H, W) float32  — real FLAIR (unchanged)
+        rlab     : (1, D, H, W) int64    — real label remapped {0..5}
+        rroi     : (1, D, H, W) int64    — ROI mask (unchanged)
+        """
+        img = img.float()
+
+        # Route based on which synthesiser is attached.
+        # cornucopia's SynthFromLabelTransform has make_final (legacy/non-FLAIR path).
+        # CustomSynthFromLabelTransform (FLAIR path) is a plain nn.Module — no make_final.
         if hasattr(self.synth, 'make_final'):
             return self._forward_standard(slab, img, lab, roi)
-        else:
-            return self._forward_custom(slab, img, lab, roi)
+        return self._forward_custom(slab, img, lab, roi)
 
     # ------------------------------------------------------------------
     # Forward paths
     # ------------------------------------------------------------------
 
     def _forward_standard(self, slab, img, lab, roi):
-        """SynthFromLabelTransform path."""
+        """
+        Legacy path — cornucopia SynthFromLabelTransform.
+        Applies geometric deformation to all inputs using a shared random field.
+        Used when modality != 'flair'.
+        """
         final = self.synth.make_final(slab, 1)
         final.deform = final.deform.make_final(slab)
 
@@ -96,57 +122,69 @@ class SharedSynth(torch.nn.Module):
 
     def _forward_custom(self, slab, img, lab, roi):
         """
-        CustomSynthFromLabelTransform path.
+        FLAIR path — CustomSynthFromLabelTransform (no_augs=True).
 
-        FCD lesion (label 21) is remapped to cortex (label 2) before GMM
-        synthesis so the synthesiser uses the correct tissue prior.
-        Lesion appearance is handled downstream by FCD augmentations.
+        No geometric deformation is applied (disabled via no_augs=True).
+        GMM samples per-class FLAIR intensities from the one-hot label map.
+        IntensityTransform inside the synth is also disabled (donothing) —
+        it is applied downstream after FCD augmentations.
+
+        slab is remapped directly (not via one-hot round-trip) since
+        no_augs=True means slab_oh.argmax() == slab anyway.
         """
-        slab_safe = self._prepare_slab_for_synthesis(slab)
-        oh_slab = self._to_one_hot(slab_safe)
+        oh_slab = self._to_one_hot(slab)
 
-        simg, slab_oh, (rimg, rlab, rroi) = self.synth(oh_slab, coreg=[img, lab, roi])
+        # synth applies GMM only (no deform, no intensity)
+        # coreg=[img, lab, roi] passes real-branch inputs through unchanged
+        simg, _, (rimg, rlab, rroi) = self.synth(oh_slab, coreg=[img, lab, roi])
 
-        slab_out = self.remap_labels(slab_oh.argmax(dim=0, keepdim=True))
-        rlab = self.remap_labels(rlab)
+        # Remap both label maps from sparse 0..18 → consecutive 0..5
+        slab_out = self.remap_labels(slab)
+        rlab_out = self.remap_labels(rlab)
 
-        return simg, slab_out, rimg, rlab, rroi
+        return simg, slab_out, rimg, rlab_out, rroi
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _prepare_slab_for_synthesis(self, slab: torch.Tensor) -> torch.Tensor:
-        """
-        Remap FCD lesion → cortex, then clamp out-of-range values to background.
-        """
-        slab_safe = slab.clone()
-        slab_safe[slab_safe == self.FCD_LESION_LBL] = self.CORTEX_LBL
-        slab_safe[(slab_safe < 0) | (slab_safe > self.N_CLASSES)] = 0
-        return slab_safe
-
     def _to_one_hot(self, label_map: torch.Tensor) -> torch.Tensor:
-        """Convert a label map to a one-hot float tensor (C, D, H, W)."""
+        """
+        Convert integer label map → one-hot float tensor (C, D, H, W).
+        num_classes = N_CLASSES + 1 = 19 to accommodate labels 0..18 inclusive.
+        """
         return (
             torch.nn.functional.one_hot(
-                label_map.long().squeeze(0), num_classes=self.N_CLASSES
+                label_map.long().squeeze(0),
+                num_classes=self.N_CLASSES + 1  # 19: covers labels 0..18
             )
             .permute(3, 0, 1, 2)
             .float()
         )
 
     def remap_labels(self, label_map: torch.Tensor) -> torch.Tensor:
-        """Map sparse label values → consecutive class indices (0 = background)."""
+        """
+        Map sparse label values → consecutive model class indices.
+
+        target_labels = [(1,), (2,), (3,), (4,), (18,)]
+        Mapping:
+            label 1  → class 1 (White Matter)
+            label 2  → class 2 (Cerebral Cortex)
+            label 3  → class 3 (Deep Gray Matter)
+            label 4  → class 4 (CSF)
+            label 18 → class 5 (WM-GM Separator)
+            all else → class 0 (Background)
+        """
         max_value = int(label_map.max().item()) + 1
-        lookup_table = torch.zeros(max_value, dtype=torch.long, device=label_map.device)
+        lut = torch.zeros(max_value, dtype=torch.long, device=label_map.device)
 
         for class_index, group in enumerate(self.target_labels, start=1):
             for value in group:
                 if value < max_value:
-                    lookup_table[value] = class_index
+                    lut[value] = class_index
 
-        nb_classes = len(self.target_labels) + 1
-        return torch.clamp(lookup_table[label_map.long()], 0, nb_classes - 1)
+        nb_classes = len(self.target_labels) + 1  # 6: background + 5 tissues
+        return torch.clamp(lut[label_map.long()], 0, nb_classes - 1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -154,19 +192,19 @@ class SharedSynth(torch.nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Model(pl.LightningModule):
-    # Class-level label definitions — single source of truth
+    # ── Class-level label definitions — single source of truth ───────────────
     TARGET_LABELS = [
-        (1,),  # White Matter
-        (2,),  # Cerebral Cortex
-        (3,),  # Deep Gray Matter
-        (4,),  # CSF
-        (18,),  # WM — GM Separator
+        (1,),   # White Matter
+        (2,),   # Cerebral Cortex
+        (3,),   # Deep Gray Matter
+        (4,),   # CSF
+        (18,),  # WM-GM Separator
     ]
 
     def __init__(
             self,
             ndim: int = 3,
-            nb_classes: int = 7,  # background + 5 tissues + FCD lesion
+            nb_classes: int = 7,                              # background + 5 tissues + FCD lesion
             seg_nb_levels: int = 6,
             seg_features: Sequence[int] = (16, 32, 64, 128, 256, 512),
             seg_activation: str = 'ReLU',
@@ -178,85 +216,93 @@ class Model(pl.LightningModule):
             optimizer_options: Optional[dict] = None,
             time_limit_minutes: float = None,
             modality: str = '',
-            csv_path: Optional[str] = CSV_PATH,
+            flair_stats_csv: Optional[str] = FLAIR_STATS_CSV,
             n_best_batches: int = 2,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.optimizer_name = optimizer
+        self.optimizer_name    = optimizer
         self.optimizer_options = dict(optimizer_options or {'lr': 1e-4})
         self.time_limit_minutes = time_limit_minutes
-        self.alpha = alpha  # weight on the real/FCD-augmented branch
-        self.csv_path = csv_path
-        self.target_labels = self.TARGET_LABELS
+        self.alpha             = alpha
+        self.flair_stats_csv   = flair_stats_csv
+        self.target_labels     = self.TARGET_LABELS
 
-        # Build all sub-modules
+        # ── Sub-modules ───────────────────────────────────────────────────────
         self.subject_params_cache = self._load_subject_params()
-        seg_net = self._build_seg_network(ndim, nb_classes, seg_features,
-                                          seg_activation, seg_nb_levels,
-                                          seg_nb_conv, seg_norm)
-
-        synth = self._build_synth(modality)
-        loss_fn = self._build_loss(loss)
-        self.network = SynthSeg(seg_net, synth, loss_fn)
+        seg_net       = self._build_seg_network(ndim, nb_classes, seg_features,seg_activation, seg_nb_levels, seg_nb_conv, seg_norm)
+        synth         = self._build_synth(modality)
+        loss_fn       = self._build_loss(loss)
+        self.network  = SynthSeg(seg_net, synth, loss_fn)
         self.intensity_aug = self._build_intensity_aug(modality)
+        self.fcd_aug  = FCDAugmentations()  # stateless utility — instantiated once
 
-        # Metrics
+        # ── Metrics ───────────────────────────────────────────────────────────
         _m = dict(include_background=False, num_classes=nb_classes, input_format='index')
-        self.val_dice = dice_compute(average='micro', **_m)
-        self.val_dice_fcd = dice_compute(average='none', **_m)
+        self.val_dice     = dice_compute(average='micro', **_m)
+        self.val_dice_fcd = dice_compute(average='none',  **_m)
 
-        # Manual optimisation
+        # ── Manual optimisation ───────────────────────────────────────────────
         self.automatic_optimization = False
         self.network.set_backward(self.manual_backward)
 
-        self.n_best_batches = n_best_batches  # Number of best batches to save
-        self._val_batch_cache = []  # Stores (loss, batch_data) tuples
+        # ── State ─────────────────────────────────────────────────────────────
+        self.n_best_batches    = n_best_batches
+        self._val_batch_cache  = []
+        self._saved_aug_types  = set()
 
-    # ══════════════════════════════════════════════════════════════════════
-    #  Private builders (called only from __init__)
-    # ══════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Lifecycle hooks
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def on_train_start(self):
+        # Wire the optimizer getter into SynthSeg so train_step() can call it.
+        # Done once here instead of every training_step.
+        self.network.optimizers = self.optimizers
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Private builders  (called only from __init__)
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _load_subject_params(self) -> dict:
         """Pre-load per-subject GMM parameters from CSV into a lookup cache."""
         cache = {}
-        if not (self.csv_path and os.path.exists(self.csv_path)):
+        if not (self.flair_stats_csv and os.path.exists(self.flair_stats_csv)):
             return cache
         try:
-            import pandas as pd
-            from learn2synth.custom_cc_synthseg import FLAIR_CLASS_PARAMS
+            df = pd.read_csv(self.flair_stats_csv)
+            df['subject'] = df['subject'].astype(str).str.strip()
+            # range(19): covers classes 0–18 inclusive (WM-GM Separator = 18)
+            default_keys = set(range(19)) | set(FLAIR_CLASS_PARAMS.keys())
 
-            df = pd.read_csv(self.csv_path)
-            df["subject"] = df["subject"].astype(str).str.strip()
-            default_keys = set(range(18)) | set(FLAIR_CLASS_PARAMS.keys())
-
-            for subj in df["subject"].unique():
+            for subj in df['subject'].unique():
                 params = {
-                    int(r["class_id"]): {
-                        "mu": (float(r["mu_lo"]), float(r["mu_hi"])),
-                        "sigma": (float(r["sigma_lo"]), float(r["sigma_hi"])),
+                    int(r['class_id']): {
+                        'mu':    (float(r['mu_lo']),    float(r['mu_hi'])),
+                        'sigma': (float(r['sigma_lo']), float(r['sigma_hi'])),
                     }
-                    for _, r in df[df["subject"] == subj].iterrows()
+                    for _, r in df[df['subject'] == subj].iterrows()
                 }
                 for cls in default_keys:
-                    params.setdefault(cls, FLAIR_CLASS_PARAMS.get(cls, {"mu": (0, 255), "sigma": (0, 16)}))
+                    params.setdefault(
+                        cls, FLAIR_CLASS_PARAMS.get(cls, {'mu': (0, 255), 'sigma': (0, 16)})
+                    )
                 cache[subj] = params
 
-            print(f"[Model] Preloaded per-subject params for {len(cache)} subjects.")
+            print(f'[Model] Preloaded per-subject params for {len(cache)} subjects.')
         except Exception as exc:
-            print(f"[Model] Warning: failed to parse CSV — {exc}")
+            print(f'[Model] Warning: failed to parse CSV — {exc}')
         return cache
 
     def _build_seg_network(self, ndim, nb_classes, features, activation,
                            nb_levels, nb_conv, norm):
-        backbone = UNet(ndim, features=features, activation=activation,
+        backbone = UNet(ndim, nb_features=features, activation=activation,
                         nb_levels=nb_levels, nb_conv=nb_conv, norm=norm)
         return SegNet(ndim, 1, nb_classes, backbone=backbone, activation=None)
 
     def _build_synth(self, modality: str) -> SharedSynth:
         if modality == 'flair':
-            from learn2synth.custom_cc_synthseg import FLAIR_CLASS_PARAMS
             raw = CustomSynthFromLabelTransform(
                 num_ch=1, class_params=FLAIR_CLASS_PARAMS, use_per_class_gmm=True,
                 gmm_fwhm=5, bias=5, gamma=0.4, motion_fwhm=2, resolution=4,
@@ -276,12 +322,11 @@ class Model(pl.LightningModule):
 
     def _build_loss(self, loss: str):
         options = {
-            'dice': lambda: DiceLoss(activation='Softmax'),
-            'logitmse': lambda: LogitMSELoss(),
-            'cat': lambda: CatLoss(activation='Softmax'),
-            'catmse': lambda: CatMSELoss(activation='Softmax'),
-            'dice_ce': lambda: DiceCELoss(weighted=False, lambda_dice=1.0,
-                                          lambda_ce=1.0, activation='Softmax'),
+            'dice':          lambda: DiceLoss(activation='Softmax'),
+            'logitmse':      lambda: LogitMSELoss(),
+            'cat':           lambda: CatLoss(activation='Softmax'),
+            'catmse':        lambda: CatMSELoss(activation='Softmax'),
+            'dice_ce':       lambda: DiceCELoss(activation='Softmax'),
             'focal_tversky': lambda: FocalTverskyLoss(activation='Softmax'),
         }
         if loss not in options:
@@ -291,45 +336,32 @@ class Model(pl.LightningModule):
     def _build_intensity_aug(self, modality: str):
         if modality == 'flair':
             return CustomIntensityTransform(
-                bias=5, gamma=0.4, motion_fwhm=2, resolution=4, snr=15, gfactor=3, order=3,
+                bias=5, gamma=0.4, motion_fwhm=2, resolution=4,
+                snr=15, gfactor=3, order=3,
             )
         return IntensityTransform(
             bias=7, bias_strength=0.2, gamma=0.3, motion_fwhm=3,
             resolution=4, snr=20, gfactor=2, order=3,
         )
 
-    # ══════════════════════════════════════════════════════════════════════
-    #  Label utilities
-    # ══════════════════════════════════════════════════════════════════════
-
-    def remap_labels(self, label_map: torch.Tensor) -> torch.Tensor:
-        """
-        Remap sparse FreeSurfer label values → consecutive model class indices.
-        Anything not in target_labels becomes 0 (background).
-        """
-        max_val = int(label_map.max().item()) + 1
-        lut = torch.zeros(max_val, dtype=torch.long, device=label_map.device)
-        for cls_idx, group in enumerate(self.target_labels, start=1):
-            for val in group:
-                if val < max_val:
-                    lut[val] = cls_idx
-        nb_classes = len(self.target_labels) + 1
-        return torch.clamp(lut[label_map.long()], 0, nb_classes - 1)
+    # ══════════════════════════════════════════════════════════════════════════
+    #  GMM subject param switching
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _set_subject_params(self, subject_id: Optional[str]):
-        """Swap GMM class_params for the current subject (or fall back to global defaults)."""
+        """Swap GMM class_params for the current subject (falls back to global)."""
         gmm = getattr(getattr(self.network.synth, 'synth', None), 'gmm', None)
         if gmm is None or not hasattr(gmm, 'class_params'):
             return
-        if subject_id and subject_id in self.subject_params_cache:
-            gmm.class_params = self.subject_params_cache[subject_id]
-        else:
-            from learn2synth.custom_cc_synthseg import FLAIR_CLASS_PARAMS
-            gmm.class_params = FLAIR_CLASS_PARAMS
+        gmm.class_params = (
+            self.subject_params_cache[subject_id]
+            if subject_id and subject_id in self.subject_params_cache
+            else FLAIR_CLASS_PARAMS
+        )
 
-    # ══════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════
     #  Augmentation pipeline
-    # ══════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════
 
     @staticmethod
     def _parse_aug_choices(aug_type: str) -> list:
@@ -339,55 +371,55 @@ class Model(pl.LightningModule):
 
     def _apply_fcd_augmentations(self, img: torch.Tensor, roi: torch.Tensor,
                                  choices: list, params: dict) -> torch.Tensor:
-        """Apply the requested FCD augmentation chain in-place (returns new tensor)."""
-        aug = FCDAugmentations()
+        """Apply the FCD augmentation chain. Returns a new tensor."""
         for ch in choices:
             if ch == 'zoom':
-                img = aug.apply_roi_thickening(
+                img = self.fcd_aug.apply_roi_thickening(
                     img, roi, zoom_range=params['zoom_f'])
             elif ch in ('hyper', 'trans'):
-                img = aug.apply_roi_augmentations_hyperintensity(
+                img = self.fcd_aug.apply_roi_augmentations_hyperintensity(
                     img, roi,
                     intensity_range=params['int_rng'],
-                    sigma_range=params['hyper_sigma'] if ch == 'hyper' else params['trans_sigma'], )
+                    sigma_range=params['hyper_sigma'] if ch == 'hyper' else params['trans_sigma'],
+                )
             elif ch == 'blur':
-                img = aug.apply_roi_augmentations_blured(
+                img = self.fcd_aug.apply_roi_augmentations_blured(
                     img, roi, sigma_range=params['blur_sigma'])
-
         return img
 
     def _maybe_save_aug_sample(self, aug_img: torch.Tensor, aug_mask: torch.Tensor,
                                aug_type: str):
         """Save one NIfTI sample per aug_type for debugging (fires once per type)."""
-        if not hasattr(self, '_saved_aug_types'):
-            self._saved_aug_types = set()
         if aug_type in self._saved_aug_types:
             return
         self._saved_aug_types.add(aug_type)
-        import nibabel as nib, numpy as np
         save_dir = '/kaggle/working/saved_augs'
         os.makedirs(save_dir, exist_ok=True)
-        nib.save(nib.Nifti1Image(aug_img.detach().cpu().numpy(), np.eye(4)),
-                 os.path.join(save_dir, f'subj_aug_{aug_type}_img.nii.gz'))
-        nib.save(nib.Nifti1Image(aug_mask.detach().cpu().numpy().astype(np.uint8), np.eye(4)),
-                 os.path.join(save_dir, f'subj_aug_{aug_type}_mask.nii.gz'))
+        nib.save(
+            nib.Nifti1Image(aug_img.detach().cpu().numpy(), np.eye(4)),
+            os.path.join(save_dir, f'subj_aug_{aug_type}_img.nii.gz'),
+        )
+        nib.save(
+            nib.Nifti1Image(aug_mask.detach().cpu().numpy().astype(np.uint8), np.eye(4)),
+            os.path.join(save_dir, f'subj_aug_{aug_type}_mask.nii.gz'),
+        )
 
     def _process_single_sample(self, batch: dict, i: int):
         """
-        Full single-sample pipeline:
+        Full single-sample synthesis pipeline:
           SharedSynth → FCD aug → IntensityTransform → label fusion.
         Returns (aug_image, aug_mask, real_image, real_mask) or None if skipped.
         """
-        label_t = batch['label_t'][i]
-        flair_t = batch['flair_t'][i].float()
-        roi_t = batch['roi_t'][i]
-        aug_type = batch['aug_type'][i]
+        label_t    = batch['label_t'][i]
+        flair_t    = batch['flair_t'][i].float()
+        roi_t      = batch['roi_t'][i]
+        aug_type   = batch['aug_type'][i]
         subject_id = batch.get('subject_id', [None] * len(batch['label_t']))[i]
 
         aug_params = {
-            'int_rng': (batch['int_factor_min'][i].item(), batch['int_factor_max'][i].item()),
-            'blur_sigma': (batch['blur_sigma_min'][i].item(), batch['blur_sigma_max'][i].item()),
-            'zoom_f': (batch['zoom_f_min'][i].item(), batch['zoom_f_max'][i].item()),
+            'int_rng':     (batch['int_factor_min'][i].item(),  batch['int_factor_max'][i].item()),
+            'blur_sigma':  (batch['blur_sigma_min'][i].item(),  batch['blur_sigma_max'][i].item()),
+            'zoom_f':      (batch['zoom_f_min'][i].item(),      batch['zoom_f_max'][i].item()),
             'hyper_sigma': (batch['hyper_sigma_min'][i].item(), batch['hyper_sigma_max'][i].item()),
             'trans_sigma': (batch['trans_sigma_min'][i].item(), batch['trans_sigma_max'][i].item()),
         }
@@ -397,24 +429,24 @@ class Model(pl.LightningModule):
 
         self._set_subject_params(subject_id)
 
-        # Step 1: SharedSynth (geometry + GMM, no intensity)
+        # Step 1: SharedSynth — geometry + GMM, no intensity transform
         simg, slab, rimg, rlab, rroi = self.network.synth(label_t, flair_t, label_t, roi_t)
         simg_3d = simg.squeeze(0).float()
         slab_3d = slab.squeeze(0).long()
         rroi_3d = (rroi.squeeze(0) > 0).long()
 
-        # Step 2: FCD augmentations
+        # Step 2: FCD appearance augmentations (synthetic branch only)
         choices = self._parse_aug_choices(aug_type)
         aug_img = self._apply_fcd_augmentations(simg_3d.clone(), rroi_3d, choices, aug_params)
 
-        # Step 3: Debug save (once per aug_type)
+        # Step 3: Debug NIfTI save — fires once per aug_type
         self._maybe_save_aug_sample(aug_img, rroi_3d, aug_type)
 
-        # Step 4: Standalone IntensityTransform
-        aug_out = self.intensity_aug(aug_img.float().unsqueeze(0))
+        # Step 4: Standalone IntensityTransform (bias field, gamma, noise, resolution)
+        aug_out        = self.intensity_aug(aug_img.float().unsqueeze(0))
         aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
 
-        # Step 5: Fuse FCD lesion label (class 6) into segmentation maps
+        # Step 5: Fuse FCD lesion (ROI → class 6) into both label maps
         slab_with_fcd = slab_3d.clone()
         slab_with_fcd[rroi_3d > 0] = 6
 
@@ -422,18 +454,15 @@ class Model(pl.LightningModule):
         rlab_with_fcd[rroi_3d > 0] = 6
 
         return (
-            aug_image_item,  # (1, Z, Y, X)
-            slab_with_fcd.unsqueeze(0),  # (1, Z, Y, X)
-            rimg.float(),
-            rlab_with_fcd.unsqueeze(0),
+            aug_image_item,              # (1, D, H, W)  synthetic FLAIR — normalized [0,1]
+            slab_with_fcd.unsqueeze(0),  # (1, D, H, W)  synthetic target {0–6}
+            rimg.float(),                # (1, D, H, W)  real FLAIR — raw scale [~0, 245]
+            rlab_with_fcd.unsqueeze(0),  # (1, D, H, W)  real target {0–6}
         )
 
     def synthesize_batch(self, batch: dict):
-        """
-        Run the full augmentation pipeline for every sample in the batch.
-        Returns (aug_image, aug_mask, real_image, real_mask) stacked tensors.
-        """
-        results = []
+        """Run the synthesis pipeline for every sample. Returns stacked tensors."""
+        results     = []
         device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
         with torch.autocast(device_type=device_type, enabled=False):
             for i in range(len(batch['label_t'])):
@@ -449,88 +478,36 @@ class Model(pl.LightningModule):
             torch.stack(real_masks).long(),
         )
 
-    # ══════════════════════════════════════════════════════════════════════
-    #  Training / Validation
-    # ══════════════════════════════════════════════════════════════════════
-
-    def _forward_both_branches(self, aug_image, aug_mask, real_image, real_mask):
-        """Shared forward + loss computation for both branches."""
-        pred_synth = self.network.segnet(aug_image)
-        loss_synth = self.network.loss(pred_synth, aug_mask)
-
-        real_image = real_image.to(self.device)
-        real_labels = real_mask.squeeze(1).to(self.device)
-        pred_real = self.network.segnet(real_image)
-        loss_real = self.network.loss(pred_real, real_labels.unsqueeze(1))
-
-        return pred_synth, loss_synth, pred_real, real_labels, loss_real
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Training
+    # ══════════════════════════════════════════════════════════════════════════
 
     def training_step(self, batch, batch_idx):
+        # Periodically free CUDA cache to prevent fragmentation over long runs
         if self.trainer.current_epoch % 10 == 0 and batch_idx == 0:
             torch.cuda.empty_cache()
 
         aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
 
-        # Store the optimizer getter method so train_step() can access it
-        self.network.optimizers = self.optimizers
-
-        # Now call train_step which will use the stored optimizer reference
         loss_synth, loss_real = self.network.train_step(
             aug_image, aug_mask, real_image, real_mask)
+
         loss = loss_synth + self.alpha * loss_real
         self.log('train_loss', loss, prog_bar=True)
-        # self.log('train_loss_real', loss_real, prog_bar=False)
         return loss
 
-    # def validation_step(self, batch, batch_idx):
-    #     # if batch_idx == 0:
-    #     # Full predictions and diagnostics for first batch only
-    #     with torch.no_grad():
-    #         aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
-    #         loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
-    #             aug_image, aug_mask, real_image, real_mask)
-    #         real_labels = real_mask.squeeze(1)  # Use real_mask you already have
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Validation
+    # ══════════════════════════════════════════════════════════════════════════
 
-    #     # Convert to CPU and get label indices
-    #     pred_real_cpu = pred_real.cpu()
-    #     real_mask_cpu = real_mask.cpu()
-
-    #     pred_labels = pred_real_cpu.argmax(dim=1)  # [B, H, W, D]
-    #     target_labels = real_mask_cpu.squeeze(1).long()  # [B, H, W, D]
-
-    #     # FIX: Update the CLASS-LEVEL metrics, not a local one
-    #     self.val_dice.update(pred_labels, target_labels)
-    #     self.val_dice_fcd.update(pred_labels, target_labels)
-    #     if batch_idx == 0:
-    #         # Log diagnostics
-    #         self._log_val_diagnostics(pred_synth, pred_labels, aug_image,
-    #                                   real_image, aug_mask, target_labels)
-
-    # loss = loss_synth + self.alpha * loss_real
-    # self.log('eval_loss', loss, prog_bar=True)
-    # return loss
-
-    # else:
-    #     # Lightweight computation for remaining batches
-    #     with torch.no_grad():
-    #         aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
-    #         loss_synth, loss_real = self.network.eval_step(
-    #             aug_image, aug_mask, real_image, real_mask)
-
-    #     loss = loss_synth + self.alpha * loss_real
-    #     self.log('eval_loss', loss, prog_bar=True)
-    #     return loss
     def validation_step(self, batch, batch_idx):
         with torch.no_grad():
             aug_image, aug_mask, real_image, real_mask = self.synthesize_batch(batch)
             loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
                 aug_image, aug_mask, real_image, real_mask)
-            real_labels = real_mask.squeeze(1)
 
-        pred_real_cpu = pred_real.cpu()
-        real_mask_cpu = real_mask.cpu()
-        pred_labels = pred_real_cpu.argmax(dim=1)
-        target_labels = real_mask_cpu.squeeze(1).long()
+        pred_labels   = pred_real.cpu().argmax(dim=1)
+        target_labels = real_mask.cpu().squeeze(1).long()
 
         self.val_dice.update(pred_labels, target_labels)
         self.val_dice_fcd.update(pred_labels, target_labels)
@@ -538,82 +515,76 @@ class Model(pl.LightningModule):
         loss = loss_synth + self.alpha * loss_real
         self.log('eval_loss', loss, prog_bar=True)
 
-        # Store batch data for potential "best batch" logging
-        # Use negative loss so lower loss = higher priority (or use dice score)
-        batch_score = -loss.item()  # or compute a dice score here
-
-        batch_data = {
-            'pred_synth': pred_synth.cpu(),
-            'pred_labels': pred_labels,
-            'aug_image': aug_image.cpu(),
-            'real_image': real_image.cpu(),
-            'aug_mask': aug_mask.cpu(),
+        # Cache for top-N best-batch NIfTI diagnostics
+        self._val_batch_cache.append({
+            'pred_synth':    pred_synth.cpu(),
+            'pred_labels':   pred_labels,
+            'aug_image':     aug_image.cpu(),
+            'real_image':    real_image.cpu(),
+            'aug_mask':      aug_mask.cpu(),
             'target_labels': target_labels,
-            'score': batch_score,
-            'batch_idx': batch_idx,
-        }
-
-        # Keep only top N batches (sorted by score, highest = best)
-        self._val_batch_cache.append(batch_data)
+            'score':         -loss.item(),   # lower loss = higher score
+            'batch_idx':     batch_idx,
+        })
         self._val_batch_cache.sort(key=lambda x: x['score'], reverse=True)
         self._val_batch_cache = self._val_batch_cache[:self.n_best_batches]
 
         return loss
 
     def _log_val_diagnostics(self, pred_synth, pred_labels, aug_image,
-                             real_image, aug_mask, real_labels, suffix=""):
-        """Log class-count scalars and save NIfTI samples every 10 epochs."""
+                             real_image, aug_mask, real_labels, suffix=''):
+        """Log class-count scalars and save NIfTI samples every 20 epochs."""
         pred_synth_argmax = pred_synth[0].argmax(dim=0)
-        pred_real_argmax = pred_labels[0]
-        self.log('pred_synth_num_classes', float(len(torch.unique(pred_synth_argmax))), prog_bar=False)
-        self.log('pred_real_num_classes', float(len(torch.unique(pred_real_argmax))), prog_bar=False)
+        pred_real_argmax  = pred_labels[0]
+        self.log('pred_synth_num_classes',
+                 float(len(torch.unique(pred_synth_argmax))), prog_bar=False)
+        self.log('pred_real_num_classes',
+                 float(len(torch.unique(pred_real_argmax))),  prog_bar=False)
 
-        epoch = self.trainer.current_epoch
-        if epoch % 20 != 0:
+        if self.trainer.current_epoch % 20 != 0:
             return
 
         base_dir = self.trainer.log_dir or self.trainer.default_root_dir
         img_root = os.path.join(base_dir, 'images')
         makedirs(img_root, exist_ok=True)
-        print(f'\n[Saving] Sample images for Epoch {epoch} {suffix} to {img_root}...')
+        print(f'\n[Saving] NIfTI diagnostics — Epoch {self.trainer.current_epoch}'
+              f' {suffix} → {img_root}')
 
-        p = f'{img_root}/epoch-{epoch:04d}'
-        save(pred_synth_argmax, f'{p}_{suffix}_synth-pred.nii.gz')
-        save(pred_real_argmax, f'{p}_{suffix}_real-pred.nii.gz')
-        save(aug_image[0].squeeze(0), f'{p}_{suffix}_synth-image.nii.gz')
-        save(real_image[0].squeeze(0), f'{p}_{suffix}_real-image.nii.gz')
-        save(aug_mask[0].squeeze(0).to(torch.uint8), f'{p}_{suffix}_synth-ref.nii.gz')
-        save(real_labels[0].to(torch.uint8), f'{p}_{suffix}_real-ref.nii.gz')
+        p = f'{img_root}/epoch-{self.trainer.current_epoch:04d}'
+        save(pred_synth_argmax,                  f'{p}_{suffix}_synth-pred.nii.gz')
+        save(pred_real_argmax,                   f'{p}_{suffix}_real-pred.nii.gz')
+        save(aug_image[0].squeeze(0),            f'{p}_{suffix}_synth-image.nii.gz')
+        save(real_image[0].squeeze(0),           f'{p}_{suffix}_real-image.nii.gz')
+        save(aug_mask[0].squeeze(0).to(torch.uint8),  f'{p}_{suffix}_synth-ref.nii.gz')
+        save(real_labels[0].to(torch.uint8),     f'{p}_{suffix}_real-ref.nii.gz')
 
     def on_validation_epoch_end(self):
-        # Log diagnostics for the best N batches
-        for i, batch_data in enumerate(self._val_batch_cache):
+        # Save NIfTI diagnostics for the best N cached batches
+        for i, bd in enumerate(self._val_batch_cache):
             self._log_val_diagnostics(
-                batch_data['pred_synth'].to(self.device),
-                batch_data['pred_labels'],
-                batch_data['aug_image'].to(self.device),
-                batch_data['real_image'].to(self.device),
-                batch_data['aug_mask'].to(self.device),
-                batch_data['target_labels'],
-                suffix=f"_best{i}_batch{batch_data['batch_idx']}"  # Add suffix to distinguish
+                bd['pred_synth'].to(self.device),
+                bd['pred_labels'],
+                bd['aug_image'].to(self.device),
+                bd['real_image'].to(self.device),
+                bd['aug_mask'].to(self.device),
+                bd['target_labels'],
+                suffix=f'_best{i}_batch{bd["batch_idx"]}',
             )
-
-        # Clear cache for next epoch
         self._val_batch_cache = []
 
         dice_epoch = self.val_dice.compute()
         dice_per_cls = self.val_dice_fcd.compute()
         dice_fcd = dice_per_cls[5] if len(dice_per_cls) > 5 else torch.tensor(0.0)
 
-        self.log('val_dice', dice_epoch, prog_bar=True)
-        self.log('val_dice_fcd', dice_fcd, prog_bar=False)
+        self.log('val_dice',     dice_epoch, prog_bar=True)
+        self.log('val_dice_fcd', dice_fcd,   prog_bar=False)
 
         tl = self.trainer.callback_metrics.get('train_loss', -1)
-        el = self.trainer.callback_metrics.get('eval_loss', -1)
+        el = self.trainer.callback_metrics.get('eval_loss',  -1)
         print(f"\n{'=' * 40}")
         print(f"EPOCH {self.trainer.current_epoch} SUMMARY:")
-        print(f"  Train Loss    : {tl:.4f}")
-        print(f"  Eval Loss     : {el:.4f}")
+        print(f"  Train Loss    : {float(tl):.4f}")
+        print(f"  Eval Loss     : {float(el):.4f}")
         print(f"  DICE SCORE    : {dice_epoch:.4f}")
         print(f"  DICE FCD (c6) : {dice_fcd:.4f}")
         print(f"{'=' * 40}\n")
@@ -623,18 +594,20 @@ class Model(pl.LightningModule):
 
         el_metric = self.trainer.callback_metrics.get('eval_loss')
         if el_metric is not None and hasattr(self, '_scheduler'):
-            loss_val = el_metric.item() if hasattr(el_metric, 'item') else float(el_metric)
-            self._scheduler.step(loss_val)
-            current_lr = self._scheduler.optimizer.param_groups[0]['lr']
-            print(f'  LR            : {current_lr:.2e}')
+            self._scheduler.step(
+                el_metric.item() if hasattr(el_metric, 'item') else float(el_metric)
+            )
+            lr = self._scheduler.optimizer.param_groups[0]['lr']
+            print(f'  LR            : {lr:.2e}')
 
-    # ══════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════
     #  Optimiser / callbacks / inference
-    # ══════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════
 
     def configure_optimizers(self):
-        opt_cls = getattr(optim, self.optimizer_name)
-        optimizer = opt_cls(self.network.segnet.parameters(), **(self.optimizer_options or {}))
+        opt_cls   = getattr(optim, self.optimizer_name)
+        optimizer = opt_cls(self.network.segnet.parameters(),
+                            **(self.optimizer_options or {}))
         self._scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', patience=10, factor=0.5, min_lr=1e-6,
         )
@@ -645,7 +618,6 @@ class Model(pl.LightningModule):
 
     def forward(self, x):
         return self.network.segnet(x)
-
 
 # ── Helper Functions ──────────────────────────────────────────────────────────
 
