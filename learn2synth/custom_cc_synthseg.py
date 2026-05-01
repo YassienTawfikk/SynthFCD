@@ -56,7 +56,7 @@ def load_class_params_from_csv(
         ``{class_id: {"mu": (lo, hi), "sigma": (lo, hi)}, ...}``
     """
     if fallback is None:
-        fallback = FLAIR_CLASS_PARAMS
+        fallback = {}
 
     df = pd.read_csv(csv_path)
 
