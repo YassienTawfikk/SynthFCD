@@ -309,7 +309,7 @@ class FCDDataModule(pl.LightningDataModule):
         # real intensity statistics expected by FCDParameterCalculator.
         print("[FCDDataModule] Computing FCD augmentation parameters…")
         self._calc = FCDParameterCalculator()
-        self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(            
+        self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(
             dataset_path=raw_root,
             label_file=label_file,
             flair_file=flair_file,
@@ -551,7 +551,7 @@ class Model(pl.LightningModule):
             optimizer: str = 'Adam',
             optimizer_options: Optional[dict] = None,
             time_limit_minutes: float = None,
-            modality: str = '',
+            modality: str = 'random',
             flair_stats_csv: Optional[str] = FLAIR_STATS_CSV,
             n_best_batches: int = 2,
     ):
@@ -571,7 +571,7 @@ class Model(pl.LightningModule):
         synth         = self._build_synth(modality)
         loss_fn       = self._build_loss(loss)
         self.network  = SynthSeg(seg_net, synth, loss_fn)
-        self.intensity_aug = self._build_intensity_aug(modality)
+        self.intensity_aug = self._build_intensity_aug()
         self.fcd_aug  = FCDAugmentations()  # stateless utility — instantiated once
 
         # ── Metrics ───────────────────────────────────────────────────────────
@@ -668,15 +668,15 @@ class Model(pl.LightningModule):
         if modality == 'flair':
             raw = CustomSynthFromLabelTransform(
                 num_ch=1, class_params=FLAIR_CLASS_PARAMS, use_per_class_gmm=True,
-                gmm_fwhm=5, bias=5, gamma=0.4, motion_fwhm=2, resolution=4,
-                snr=15, gfactor=3, rotation=10, shears=0.008, zooms=0.10,
-                elastic=0.03, elastic_nodes=8, order=3, no_augs=True,
+                gmm_fwhm=10, bias=7, gamma=0.5, motion_fwhm=2.0, resolution=3,
+                snr=10, gfactor=3, rotation=15, shears=0.012, zooms=0.15,
+                elastic=0.05, elastic_nodes=10, order=3, no_augs=True,
             )
         else:
             raw = SynthFromLabelTransform(
-                one_hot=False, target_labels=self.target_labels,
+                target_labels=self.target_labels,
                 elastic=0.05, elastic_nodes=10, rotation=15, shears=0.012,
-                zooms=0.15, resolution=5, motion_fwhm=2.0, snr=10,
+                zooms=0.15, resolution=3, motion_fwhm=2.0, snr=10,
                 gmm_fwhm=10, gamma=0.5, bias=7, bias_strength=0.5,
             )
             raw.intensity = IdentityTransform()
@@ -696,12 +696,7 @@ class Model(pl.LightningModule):
             raise ValueError(f"Unsupported loss '{loss}'. Choose from: {list(options)}")
         return options[loss]()
 
-    def _build_intensity_aug(self, modality: str):
-        if modality == 'flair':
-            return IntensityTransform(
-                bias=5, gamma=0.4, motion_fwhm=2, resolution=4,
-                snr=15, gfactor=3, order=3,
-            )
+    def _build_intensity_aug(self):
         return IntensityTransform(
             bias=7, bias_strength=0.2, gamma=0.3, motion_fwhm=3,
             resolution=4, snr=20, gfactor=2, order=3,
@@ -735,7 +730,7 @@ class Model(pl.LightningModule):
         """Apply the FCD augmentation chain. Returns a new tensor."""
         for ch in choices:
             if ch == 'zoom':
-                img = self.fcd_aug.apply_roi_thickening(
+                img, roi = self.fcd_aug.apply_roi_thickening(
                     img, roi, zoom_range=params['zoom_f'])
             elif ch in ('hyper', 'trans'):
                 img = self.fcd_aug.apply_roi_augmentations_hyperintensity(
@@ -746,7 +741,7 @@ class Model(pl.LightningModule):
             elif ch == 'blur':
                 img = self.fcd_aug.apply_roi_augmentations_blured(
                     img, roi, sigma_range=params['blur_sigma'])
-        return img
+        return img, roi
 
     def _maybe_save_aug_sample(self, aug_img: torch.Tensor, aug_mask: torch.Tensor,
                                aug_type: str):
@@ -798,7 +793,7 @@ class Model(pl.LightningModule):
 
         # Step 2: FCD appearance augmentations (synthetic branch only)
         choices = self._parse_aug_choices(aug_type)
-        aug_img = self._apply_fcd_augmentations(simg_3d.clone(), rroi_3d, choices, aug_params)
+        aug_img, rroi_3d = self._apply_fcd_augmentations(simg_3d.clone(), rroi_3d, choices, aug_params)
 
         # Step 3: Debug NIfTI save — fires once per aug_type
         self._maybe_save_aug_sample(aug_img, rroi_3d, aug_type)
@@ -993,7 +988,6 @@ class Model(pl.LightningModule):
 
     def forward(self, x):
         return self.network.segnet(x)
-
 
 # ── Helper Functions ──────────────────────────────────────────────────────────
 
@@ -1237,7 +1231,7 @@ class CLI(LightningCLI):
         print()
 
         kwargs["default_root_dir"] = save_dir
-        kwargs["enable_progress_bar"] = False        
+        kwargs["enable_progress_bar"] = False
         kwargs["logger"] = logger
         kwargs["callbacks"] = cbs
         return super().instantiate_trainer(**kwargs)
