@@ -83,10 +83,10 @@ class FCDDataset(Dataset):
             label_paths,
             flair_paths,
             roi_paths,
-            fcd_intensity_range=(0.1, 0.5),
+            fcd_intensity_range=(0.02, 0.3602),
             fcd_tail_length_range=(20, 50),
             blur_sigma_range=(0.7, 1.7),
-            zoom_f_range=(0.2, 0.4),
+            zoom_f_range=(0.5, 0.7),
             hyper_sigma_range=(0.0, 0.3),
             trans_sigma_range=(0.0, 0.3)
     ):
@@ -790,6 +790,10 @@ class Model(pl.LightningModule):
         simg_3d = simg.squeeze(0).float()
         slab_3d = slab.squeeze(0).long()
         rroi_3d = (rroi.squeeze(0) > 0).long()
+
+        # FLAIR synthetic images are in [0, 255] range, but FCD augmentations expect [0, 1]
+        if self.hparams.modality == 'flair':
+            simg_3d = torch.clamp(simg_3d / 255.0, 0.0, 1.0)
 
         # Step 2: FCD appearance augmentations (synthetic branch only)
         choices = self._parse_aug_choices(aug_type)
