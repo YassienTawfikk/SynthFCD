@@ -1002,6 +1002,90 @@ def save(dat, fname):
     nib.save(nib.Nifti1Image(dat, np.eye(4), h), fname)
 
 
+def _combine_metric_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge duplicate Lightning metric rows safely.
+
+    Lightning often logs different metrics on separate rows with the same
+    epoch/step. This combines rows by keeping the first non-null value per
+    metric column, instead of dropping useful values.
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    if "epoch" not in df.columns:
+        return df
+
+    if "step" not in df.columns:
+        df["step"] = np.nan
+
+    # Keep stable ordering before grouping
+    sort_cols = [c for c in ["epoch", "step"] if c in df.columns]
+    df = df.sort_values(sort_cols, kind="stable")
+
+    def first_non_null(series):
+        non_null = series.dropna()
+        return non_null.iloc[0] if len(non_null) else np.nan
+
+    grouped = (
+        df.groupby(["epoch", "step"], dropna=False, as_index=False)
+          .agg(first_non_null)
+    )
+
+    return grouped.sort_values(["epoch", "step"], kind="stable").reset_index(drop=True)
+
+
+def preserve_existing_metrics_history(run_dir: str):
+    """
+    Preserve existing metrics.csv before a resumed run can overwrite/restart it.
+
+    Creates/updates:
+        metrics_history.csv
+
+    This keeps the same run folder and same run name.
+    """
+    metrics_path = os.path.join(run_dir, "metrics.csv")
+    history_path = os.path.join(run_dir, "metrics_history.csv")
+
+    if not os.path.exists(metrics_path):
+        return
+
+    try:
+        frames = []
+
+        if os.path.exists(history_path):
+            old_history = pd.read_csv(history_path)
+            if not old_history.empty:
+                frames.append(old_history)
+
+        current_metrics = pd.read_csv(metrics_path)
+        if not current_metrics.empty:
+            frames.append(current_metrics)
+
+        if not frames:
+            return
+
+        merged = pd.concat(frames, ignore_index=True, sort=False)
+        merged = _combine_metric_rows(merged)
+        merged.to_csv(history_path, index=False)
+
+        # Optional snapshot for debugging/recovery
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        snapshot_path = os.path.join(run_dir, f"metrics_before_resume_{timestamp}.csv")
+        shutil.copy2(metrics_path, snapshot_path)
+
+        print(f"[MetricsHistory] Preserved existing metrics → {history_path}")
+        print(f"[MetricsHistory] Snapshot saved → {snapshot_path}")
+
+    except Exception as e:
+        print(f"[MetricsHistory] WARNING: failed to preserve existing metrics: "
+              f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  TimeLimitCallback
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1044,65 +1128,203 @@ class TimeLimitCallback(Callback):
 #  after every validation epoch. Silent on errors — never blocks training.
 # ══════════════════════════════════════════════════════════════════════════════
 class LossGraphCallback(Callback):
-    """Dual-axis loss + dice plot, one PNG per validation epoch."""
+    """
+    Dual-axis loss + dice plot, saved after every validation epoch.
+
+    Resume-safe behavior:
+      - Reads metrics_history.csv if available.
+      - Merges it with the current metrics.csv.
+      - Writes the merged full history back to metrics_history.csv.
+      - Plots from the full merged history, so curves start from epoch 0.
+    """
+
+    def __init__(
+        self,
+        history_filename: str = "metrics_history.csv",
+        live_filename: str = "metrics.csv",
+        plot_filename: str = "training_plot.png",
+    ):
+        self.history_filename = history_filename
+        self.live_filename = live_filename
+        self.plot_filename = plot_filename
+
+    def _get_log_dir(self, trainer):
+        """
+        Prefer trainer.log_dir, but fall back to the CSVLogger log_dir
+        if multiple loggers are used.
+        """
+        if trainer.log_dir:
+            return trainer.log_dir
+
+        loggers = trainer.loggers if isinstance(trainer.loggers, list) else [trainer.logger]
+        for logger in loggers:
+            if isinstance(logger, CSVLogger):
+                return logger.log_dir
+
+        return None
+
+    def _read_csv_if_exists(self, path_: str):
+        if not os.path.exists(path_):
+            return None
+        try:
+            df = pd.read_csv(path_)
+            return df if not df.empty else None
+        except Exception as e:
+            print(f"[LossGraph] Failed to read {path_}: {type(e).__name__}: {e}")
+            return None
+
+    def _load_full_metrics(self, log_dir: str):
+        live_path = os.path.join(log_dir, self.live_filename)
+        history_path = os.path.join(log_dir, self.history_filename)
+
+        frames = []
+
+        history = self._read_csv_if_exists(history_path)
+        if history is not None:
+            frames.append(history)
+
+        live = self._read_csv_if_exists(live_path)
+        if live is not None:
+            frames.append(live)
+
+        if not frames:
+            return None
+
+        metrics = pd.concat(frames, ignore_index=True, sort=False)
+        metrics = _combine_metric_rows(metrics)
+
+        # Persist the merged full history after every validation epoch
+        try:
+            metrics.to_csv(history_path, index=False)
+        except Exception as e:
+            print(f"[LossGraph] Failed to update {history_path}: "
+                  f"{type(e).__name__}: {e}")
+
+        return metrics
+
+    def _make_epoch_metrics(self, metrics: pd.DataFrame):
+        """
+        Build an epoch-level table for plotting.
+
+        Losses are averaged per epoch.
+        Dice values are averaged safely too, since NaNs are ignored by pandas.
+        """
+        if metrics is None or metrics.empty or "epoch" not in metrics.columns:
+            return None
+
+        numeric = metrics.copy()
+
+        for col in numeric.columns:
+            if col not in ("epoch", "step"):
+                numeric[col] = pd.to_numeric(numeric[col], errors="coerce")
+
+        return numeric.groupby("epoch").mean(numeric_only=True)
 
     def on_validation_epoch_end(self, trainer, pl_module):
         try:
-            if not trainer.log_dir:
-                return
-            metrics_path = os.path.join(trainer.log_dir, "metrics.csv")
-            plot_path = os.path.join(trainer.log_dir, "training_plot.png")
-            if not os.path.exists(metrics_path):
-                return
-            try:
-                metrics = pd.read_csv(metrics_path)
-            except Exception as e:
-                print(f"[LossGraph] Failed to read metrics.csv at epoch "
-                      f"{trainer.current_epoch}: {type(e).__name__}: {e}")
+            log_dir = self._get_log_dir(trainer)
+            if not log_dir:
                 return
 
-            epoch_metrics = metrics.groupby("epoch").mean()
+            plot_path = os.path.join(log_dir, self.plot_filename)
 
-            fig, ax1 = plt.subplots(figsize=(10, 6))
+            metrics = self._load_full_metrics(log_dir)
+            epoch_metrics = self._make_epoch_metrics(metrics)
 
-            if 'train_loss' in epoch_metrics:
-                ax1.plot(epoch_metrics.index, epoch_metrics['train_loss'],
-                         label='Train Loss', color='blue', linestyle='-', alpha=0.7)
-            if 'eval_loss' in epoch_metrics:
-                ax1.plot(epoch_metrics.index, epoch_metrics['eval_loss'],
-                         label='Val Loss', color='red', linestyle='--')
+            if epoch_metrics is None or epoch_metrics.empty:
+                return
 
-            ax1.set_xlabel('Epoch')
-            ax1.set_ylabel('Loss')
+            fig, ax1 = plt.subplots(figsize=(11, 6))
+
+            # Loss axis
+            if "train_loss" in epoch_metrics:
+                ax1.plot(
+                    epoch_metrics.index,
+                    epoch_metrics["train_loss"],
+                    label="Train Loss",
+                    color="blue",
+                    linestyle="-",
+                    alpha=0.75,
+                    linewidth=1.8,
+                )
+
+            if "eval_loss" in epoch_metrics:
+                ax1.plot(
+                    epoch_metrics.index,
+                    epoch_metrics["eval_loss"],
+                    label="Val Loss",
+                    color="red",
+                    linestyle="--",
+                    linewidth=1.8,
+                )
+
+            ax1.set_xlabel("Epoch")
+            ax1.set_ylabel("Loss")
             ax1.set_ylim(bottom=0)
-            ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
+            ax1.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.6)
 
+            # Dice axis
             ax2 = ax1.twinx()
-            if 'val_dice' in epoch_metrics:
-                ax2.plot(epoch_metrics.index, epoch_metrics['val_dice'],
-                         label='Val Dice', color='green', linewidth=2)
-            if 'val_dice_fcd' in epoch_metrics:
-                ax2.plot(epoch_metrics.index, epoch_metrics['val_dice_fcd'],
-                         label='Val Dice FCD (c6)', color='orange',
-                         linewidth=2, linestyle='--')
-            ax2.set_ylabel('Dice')
+
+            if "val_dice" in epoch_metrics:
+                ax2.plot(
+                    epoch_metrics.index,
+                    epoch_metrics["val_dice"],
+                    label="Val Dice",
+                    color="green",
+                    linewidth=2.2,
+                )
+
+            if "val_dice_fcd" in epoch_metrics:
+                ax2.plot(
+                    epoch_metrics.index,
+                    epoch_metrics["val_dice_fcd"],
+                    label="Val Dice FCD (c6)",
+                    color="orange",
+                    linewidth=2.2,
+                    linestyle="--",
+                )
+
+            ax2.set_ylabel("Dice")
             ax2.set_ylim(0, 1)
+
+            # Mark current epoch
+            ax1.axvline(
+                trainer.current_epoch,
+                color="gray",
+                linestyle=":",
+                linewidth=1,
+                alpha=0.7,
+            )
 
             lines1, labels1 = ax1.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
+
             ax1.legend(
-                lines1 + lines2, labels1 + labels2,
-                loc='upper center', bbox_to_anchor=(0.5, -0.12),
-                ncol=4, frameon=True,
+                lines1 + lines2,
+                labels1 + labels2,
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.13),
+                ncol=4,
+                frameon=True,
             )
 
-            fig.suptitle(f'Training Metrics (Epoch {trainer.current_epoch})')
+            first_epoch = int(epoch_metrics.index.min())
+            last_epoch = int(epoch_metrics.index.max())
+
+            fig.suptitle(
+                f"Training Metrics | Epochs {first_epoch}–{last_epoch} "
+                f"(current: {trainer.current_epoch})"
+            )
             fig.tight_layout(rect=[0, 0.08, 1, 0.95])
 
             try:
-                plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+                plt.savefig(plot_path, dpi=160, bbox_inches="tight")
             finally:
                 plt.close()
+
+            print(f"[LossGraph] Updated full-history plot → {plot_path}")
+
         except Exception as e:
             print(f"[LossGraph] ❌ Error at epoch {trainer.current_epoch}: "
                   f"{type(e).__name__}: {e}")
@@ -1212,6 +1434,9 @@ class CLI(LightningCLI):
         default_root = kwargs.get("default_root_dir", "experiments")
         save_dir = os.path.join(default_root, run_name)
         makedirs(save_dir, exist_ok=True)
+
+        # Preserve old metrics before the new CSVLogger can overwrite/restart metrics.csv
+        preserve_existing_metrics_history(save_dir)
 
         print(f"[System] Initializing Run: {run_name}")
         print(f"[System] All artifacts will be stored in: {save_dir}")
