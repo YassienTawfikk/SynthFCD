@@ -17,6 +17,10 @@ import cornucopia as cc
 import pandas as pd
 
 
+def donothing(x):
+    return x
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CSV loader
 # ─────────────────────────────────────────────────────────────────────────────
@@ -63,7 +67,7 @@ def load_class_params_from_csv(
 
     params = {
         int(row[class_id_col]): {
-            "mu": (float(row[mu_lo_col]), float(row[mu_hi_col])),
+            "mu":    (float(row[mu_lo_col]),    float(row[mu_hi_col])),
             "sigma": (float(row[sigma_lo_col]), float(row[sigma_hi_col])),
         }
         for _, row in df.iterrows()
@@ -104,9 +108,9 @@ class RandomGaussianMixtureTransform(torch.nn.Module):
             if x.dtype.is_floating_point
             else dict(dtype=self.dtype or torch.get_default_dtype(), device=x.device)
         )
-        mu = torch.as_tensor(self.sample["mu"](len(x))).to(**backend)
+        mu    = torch.as_tensor(self.sample["mu"](len(x))).to(**backend)
         sigma = torch.as_tensor(self.sample["sigma"](len(x))).to(**backend)
-        fwhm = int(self.sample["fwhm"]())
+        fwhm  = int(self.sample["fwhm"]())
         return mu, sigma, fwhm
 
     def apply_transform(self, x, parameters):
@@ -156,12 +160,12 @@ class PerClassGaussianMixtureTransform(torch.nn.Module):
             dtype=None,
     ):
         super().__init__()
-        self.class_params = class_params
-        self.default_mu = default_mu
+        self.class_params  = class_params
+        self.default_mu    = default_mu
         self.default_sigma = default_sigma
-        self.background = background
-        self.dtype = dtype
-        self.fwhm_sampler = cc.random.Uniform.make(cc.random.make_range(0, fwhm))
+        self.background    = background
+        self.dtype         = dtype
+        self.fwhm_sampler  = cc.random.Uniform.make(cc.random.make_range(0, fwhm))
 
     @staticmethod
     def _sample_scalar(lo: float, hi: float) -> float:
@@ -174,7 +178,7 @@ class PerClassGaussianMixtureTransform(torch.nn.Module):
         mu_vals, sigma_vals = [], []
         for i in range(len(x)):
             p = self.class_params.get(i)
-            mu_lo, mu_hi = p["mu"] if p else self.default_mu
+            mu_lo,    mu_hi    = p["mu"]    if p else self.default_mu
             sigma_lo, sigma_hi = p["sigma"] if p else self.default_sigma
             mu_vals.append(self._sample_scalar(mu_lo, mu_hi))
             sigma_vals.append(self._sample_scalar(sigma_lo, sigma_hi))
@@ -185,7 +189,7 @@ class PerClassGaussianMixtureTransform(torch.nn.Module):
             else dict(dtype=self.dtype or torch.get_default_dtype(), device=x.device)
         )
         return (
-            torch.tensor(mu_vals, **backend),
+            torch.tensor(mu_vals,    **backend),
             torch.tensor(sigma_vals, **backend),
             int(self.fwhm_sampler()),
         )
@@ -273,7 +277,7 @@ class SynthFromLabelTransform(torch.nn.Module):
     ):
         super().__init__()
         self.no_augs = no_augs
-        self.num_ch = num_ch
+        self.num_ch  = num_ch
 
         # ── Geometric deformation ─────────────────────────────────────────────
         self.deform = cc.RandomAffineElasticTransform(
@@ -293,7 +297,7 @@ class SynthFromLabelTransform(torch.nn.Module):
             self.gmm = RandomGaussianMixtureTransform(fwhm=gmm_fwhm, background=0)
 
         # ── Post-GMM intensity augmentation ───────────────────────────────────
-        self.intensity = cc.IntensityTransform(
+        self.intensity = donothing if no_augs else cc.IntensityTransform(
             bias, gamma, motion_fwhm, resolution, snr, gfactor, order,
         )
 
@@ -316,17 +320,18 @@ class SynthFromLabelTransform(torch.nn.Module):
         # ── Stage 1: Geometric deformation ───────────────────────────────────
         # Stack x + coreg into one tensor so a single deform call applies the
         # same random field to everything simultaneously, then split back out.
-        if coreg is not None:
-            coreg_list = coreg if isinstance(coreg, (list, tuple)) else [coreg]
-            n_lab = x.shape[0]
-            stacked = torch.cat([x] + coreg_list, dim=0)
-            stacked = self.deform(stacked)
-            x = stacked[:n_lab]
-            coreg = [stacked[n_lab + i] for i in range(len(coreg_list))]
-            if not isinstance(coreg, (list, tuple)):
-                coreg = coreg[0]
-        else:
-            x = self.deform(x)
+        if not self.no_augs:
+            if coreg is not None:
+                coreg_list = coreg if isinstance(coreg, (list, tuple)) else [coreg]
+                n_lab      = x.shape[0]
+                stacked    = torch.cat([x] + coreg_list, dim=0)
+                stacked    = self.deform(stacked)
+                x          = stacked[:n_lab]
+                coreg      = [stacked[n_lab + i] for i in range(len(coreg_list))]
+                if not isinstance(coreg, (list, tuple)):
+                    coreg = coreg[0]
+            else:
+                x = self.deform(x)
 
         # ── Stage 2: GMM synthesis ────────────────────────────────────────────
         if self.gmm is not None:

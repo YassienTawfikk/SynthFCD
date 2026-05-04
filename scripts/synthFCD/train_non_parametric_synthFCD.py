@@ -64,6 +64,7 @@ from learn2synth.configurations import (
     flair_file,
     roi_file,
     label_file,
+    fusedmask_file,
     INTENSITY_SUBJECTS,
     TRANSMANTLE_SUBJECTS,
     HYPER_SUBJECTS,
