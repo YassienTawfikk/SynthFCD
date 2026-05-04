@@ -86,7 +86,7 @@ class FCDDataset(Dataset):
             fcd_intensity_range=(0.02, 0.3602),
             fcd_tail_length_range=(20, 50),
             blur_sigma_range=(0.7, 1.7),
-            zoom_f_range=(0.5, 0.7),
+            zoom_f_range=(0.75, 0.95),
             hyper_sigma_range=(0.0, 0.3),
             trans_sigma_range=(0.0, 0.3)
     ):
