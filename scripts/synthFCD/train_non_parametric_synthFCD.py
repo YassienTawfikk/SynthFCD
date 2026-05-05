@@ -495,15 +495,15 @@ class SharedSynth(torch.nn.Module):
     def _forward_standard(self, slab, img, lab, roi):
         """Cornucopia path — full deformation + GMM + intensity. Used when modality != 'flair'.
 
-        native_synthesis=True : label 21 pre-remapped to 2 (cortex) before cornucopia synthesis
-                                so the shared GMM assigns cortex-like intensities to lesion voxels.
+        native_synthesis=True : label 21 pre-remapped to 19 before cornucopia synthesis
+                                so the lesion gets its own GMM channel for unique intensity sampling.
                                 Deformed lab (still has 21) is remapped via remap_labels → class 6.
         """
-        # Pre-remap label 21 → 2 before cornucopia — avoids out-of-range label and ensures
-        # the shared GMM samples cortex-like intensities at lesion voxels
+        # Pre-remap label 21 → 19 before cornucopia — avoids out-of-range LUT (sized to 19)
+        # and gives the lesion its own GMM channel for unique intensity sampling in simg
         if self.native_synthesis:
             slab_synth = slab.clone()
-            slab_synth[slab_synth == 21] = 2
+            slab_synth[slab_synth == 21] = 19
         else:
             slab_synth = slab
 
