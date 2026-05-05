@@ -86,6 +86,8 @@ class FCDDataset(Dataset):
             label_paths,
             flair_paths,
             roi_paths,
+            fused_paths=None,
+            native_synthesis: bool = False,
             fcd_intensity_range=(0.02, 0.3602),
             fcd_tail_length_range=(20, 50),
             blur_sigma_range=(0.7, 1.7),
@@ -105,6 +107,8 @@ class FCDDataset(Dataset):
             trans_sigma_range: Range for transmantle signal intensity noise.
         """
         self.ndim = ndim
+        self.native_synthesis = native_synthesis
+
         self.fcd_intensity_range = fcd_intensity_range
         self.fcd_tail_length_range = fcd_tail_length_range
 
@@ -119,7 +123,11 @@ class FCDDataset(Dataset):
         # Initialize stateless utility once to minimize instantiation overhead during loading
         self._calc = FCDParameterCalculator()
 
-        for label_path, flair_path, roi_path in zip(label_paths, flair_paths, roi_paths):
+        # Normalise fused_paths — None list when not native_synthesis
+        if fused_paths is None:
+            fused_paths = [None] * len(label_paths)
+
+        for label_path, flair_path, roi_path, fused_path in zip(label_paths, flair_paths, roi_paths, fused_paths):
             subject_num = self._calc.get_subj_num(os.path.dirname(label_path))
             aug_matches = []
 
@@ -130,13 +138,13 @@ class FCDDataset(Dataset):
             if subject_num in TRANSMANTLE_SUBJECTS: aug_matches.append('trans')
 
             aug_type = '+'.join(aug_matches) if aug_matches else 'combo'
-            self.items.append((label_path, flair_path, roi_path, aug_type))
+            self.items.append((label_path, flair_path, roi_path, fused_path, aug_type))
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, idx):
-        label_path, flair_path, roi_path, aug_type = self.items[idx]
+        label_path, flair_path, roi_path, fused_path, aug_type = self.items[idx]
 
         # --- Volume Loading (I/O) ---
         flair_arr = nib.load(flair_path).get_fdata()
@@ -178,7 +186,7 @@ class FCDDataset(Dataset):
             'trans_sigma_max': torch.tensor(self.trans_sigma_range[1], dtype=torch.float32),
         }
 
-        return {
+        item = {
             'label_t': label_tensor,
             'flair_t': flair_tensor,
             'roi_t': roi_tensor,
@@ -186,6 +194,16 @@ class FCDDataset(Dataset):
             'subject_id': os.path.basename(os.path.dirname(label_path)),
             **aug_params,
         }
+
+        # --- Fused mask (native_synthesis path only) ---
+        if self.native_synthesis:
+            fused_arr = nib.load(fused_path).get_fdata().astype(int)
+            if flair_arr.shape != fused_arr.shape:
+                fused_arr = self._calc.resample_to_target(
+                    fused_arr, flair_arr.shape, True).astype(int)
+            item['fusedmask_t'] = torch.as_tensor(fused_arr, dtype=torch.int64).unsqueeze(0)
+
+        return item
 
 # ── FCDDataModule ─────────────────────────────────────────────────────────────
 #
