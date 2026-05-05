@@ -32,8 +32,6 @@ import cornucopia as cc
 from cornucopia import SynthFromLabelTransform, IntensityTransform
 from cornucopia.special import IdentityTransform
 
-from learn2synth.optim import required
-
 # NOTE: GaussianSmooth is currently unused → remove if not needed
 # from monai.transforms import GaussianSmooth
 
@@ -461,18 +459,24 @@ class SharedSynth(torch.nn.Module):
         """
         Parameters
         ----------
-        slab : (1, D, H, W) int64   — label map 0..18, used for GMM synthesis
-        img  : (1, D, H, W) float32 — real FLAIR, passed through to real branch
-        lab  : (1, D, H, W) int64   — real label map, passed through to real branch
-        roi  : (1, D, H, W) int64   — binary ROI mask, passed through to real branch
+        slab : (1, D, H, W) int64   — label map used for GMM synthesis.
+                                       Standard path: labels 0..18.
+                                       Native path:   labels 0..18 + 21 (fusedmask).
+        img  : (1, D, H, W) float32 — real FLAIR, passed through to real branch.
+        lab  : (1, D, H, W) int64   — real label map, co-deformed with slab.
+                                       Native path: fusedmask passed as both slab and lab.
+        roi  : (1, D, H, W) int64   — binary ROI mask, co-deformed with slab.
+                                       None on native path — lesion location encoded in slab.
 
         Returns
         -------
-        simg     : (1, D, H, W) float32  — synthetic FLAIR from GMM
-        slab_out : (1, D, H, W) int64    — remapped label map {0..5}
-        rimg     : (1, D, H, W) float32  — real FLAIR (unchanged)
-        rlab     : (1, D, H, W) int64    — real label remapped {0..5}
-        rroi     : (1, D, H, W) int64    — ROI mask (unchanged)
+        simg     : (1, D, H, W) float32  — synthetic FLAIR from GMM.
+        slab_out : (1, D, H, W) int64    — remapped label map {0..5} standard path,
+                                           {0..6} native path (label 21 → class 6).
+        rimg     : (1, D, H, W) float32  — real FLAIR, unchanged.
+        rlab     : (1, D, H, W) int64    — real label remapped {0..5} standard path,
+                                           {0..6} native path.
+        rroi     : (1, D, H, W) int64    — ROI mask, unchanged. None on native path.
         """
         img = img.float()
 
@@ -598,30 +602,36 @@ class Model(pl.LightningModule):
             modality: str = 'random',
             flair_stats_csv: Optional[str] = FLAIR_STATS_CSV,
             n_best_batches: int = 2,
+            native_synthesis: bool = False,
+            lesion_gmm_params: Optional[dict] = None,  # GMM (μ, σ) for label 21 — native path only
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.optimizer_name    = optimizer
-        self.optimizer_options = dict(optimizer_options or {'lr': 1e-4})
-        self.time_limit_minutes = time_limit_minutes
-        self.alpha             = alpha
-        self.flair_stats_csv   = flair_stats_csv
-        self.target_labels     = self.TARGET_LABELS
+        # ── Native Approach ───────────────────────────────────────────────────────
+        self.native_synthesis  = native_synthesis
+        self.lesion_gmm_params = lesion_gmm_params or {'mu': (100, 180), 'sigma': (5, 20)}
+
+        self.optimizer_name       = optimizer
+        self.optimizer_options    = dict(optimizer_options or {'lr': 1e-4})
+        self.time_limit_minutes   = time_limit_minutes
+        self.alpha                = alpha
+        self.flair_stats_csv      = flair_stats_csv
+        self.target_labels        = self.TARGET_LABELS
 
         # ── Sub-modules ───────────────────────────────────────────────────────
-        self.subject_params_cache = self._load_subject_params()
-        seg_net       = self._build_seg_network(ndim, nb_classes, seg_features,seg_activation, seg_nb_levels, seg_nb_conv, seg_norm)
-        synth         = self._build_synth(modality)
-        loss_fn       = self._build_loss(loss)
-        self.network  = SynthSeg(seg_net, synth, loss_fn)
-        self.intensity_aug = self._build_intensity_aug()
-        self.fcd_aug  = FCDAugmentations()  # stateless utility — instantiated once
+        self.subject_params_cache   = self._load_subject_params()
+        seg_net                     = self._build_seg_network(ndim, nb_classes, seg_features,seg_activation, seg_nb_levels, seg_nb_conv, seg_norm)
+        synth                       = self._build_synth(modality)
+        loss_fn                     = self._build_loss(loss)
+        self.network                = SynthSeg(seg_net, synth, loss_fn)
+        self.intensity_aug          = self._build_intensity_aug()
+        self.fcd_aug                = FCDAugmentations()
 
         # ── Metrics ───────────────────────────────────────────────────────────
-        _m = dict(include_background=False, num_classes=nb_classes, input_format='index')
-        self.val_dice     = dice_compute(average='micro', **_m)
-        self.val_dice_fcd = dice_compute(average='none',  **_m)
+        _m                  = dict(include_background=False, num_classes=nb_classes, input_format='index')
+        self.val_dice       = dice_compute(average='micro', **_m)
+        self.val_dice_fcd   = dice_compute(average='none',  **_m)
 
         # ── Manual optimisation ───────────────────────────────────────────────
         self.automatic_optimization = False
@@ -725,7 +735,7 @@ class Model(pl.LightningModule):
             )
             raw.intensity = IdentityTransform()
 
-        return SharedSynth(raw, target_labels=self.target_labels)
+        return SharedSynth(raw, target_labels=self.target_labels, native_synthesis=self.native_synthesis)
 
     def _build_loss(self, loss: str):
         options = {
@@ -751,14 +761,17 @@ class Model(pl.LightningModule):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _set_subject_params(self, subject_id: Optional[str]):
-        """Swap GMM class_params for the current subject (falls back to global)."""
         params = (
             self.subject_params_cache[subject_id]
             if subject_id and subject_id in self.subject_params_cache
             else FLAIR_CLASS_PARAMS
         )
         if self.hparams.modality == 'flair':
+            if self.hparams.native_synthesis:
+                params = dict(params)  # shallow copy — don't mutate the cache
+                params[21] = self.lesion_gmm_params
             self.network.synth.set_class_params(params)
+
     # ══════════════════════════════════════════════════════════════════════════
     #  Augmentation pipeline
     # ══════════════════════════════════════════════════════════════════════════
@@ -806,8 +819,9 @@ class Model(pl.LightningModule):
 
     def _process_single_sample(self, batch: dict, i: int):
         """
-        Full single-sample synthesis pipeline:
-          SharedSynth → FCD aug → IntensityTransform → label fusion.
+        Full single-sample synthesis pipeline.
+        native_synthesis=False : SharedSynth → FCD aug → IntensityTransform → label fusion
+        native_synthesis=True  : SharedSynth (fusedmask) → IntensityTransform  (no aug, no fusion)
         Returns (aug_image, aug_mask, real_image, real_mask) or None if skipped.
         """
         label_t    = batch['label_t'][i]
@@ -829,28 +843,48 @@ class Model(pl.LightningModule):
 
         self._set_subject_params(subject_id)
 
-        # Step 1: SharedSynth — geometry + GMM, no intensity transform
+        # ── Native synthesis path ─────────────────────────────────────────────────
+        if self.hparams.native_synthesis:
+            fusedmask_t = batch['fusedmask_t'][i]
+
+            # fusedmask acts as both slab (GMM input) and lab (real branch label target)
+            # roi omitted — lesion is already encoded as label 21 in fusedmask
+            simg, slab_out, rimg, rlab_out, _ = self.network.synth(
+                fusedmask_t, flair_t, fusedmask_t
+            )
+            simg_3d = simg.squeeze(0).float()
+
+            if self.hparams.modality == 'flair':
+                simg_3d = torch.clamp(simg_3d / 255.0, 0.0, 1.0)
+
+            aug_out = self.intensity_aug(simg_3d.unsqueeze(0))
+            aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
+
+            # slab_out and rlab_out already have class 6 from remap_labels — no label fusion needed
+            return (
+                aug_image_item,
+                slab_out.long(),
+                rimg.float(),
+                rlab_out.long(),
+            )
+
+        # ── Augmented synthesis path (original) ───────────────────────────────────
         simg, slab, rimg, rlab, rroi = self.network.synth(label_t, flair_t, label_t, roi_t)
         simg_3d = simg.squeeze(0).float()
         slab_3d = slab.squeeze(0).long()
         rroi_3d = (rroi.squeeze(0) > 0).long()
 
-        # FLAIR synthetic images are in [0, 255] range, but FCD augmentations expect [0, 1]
         if self.hparams.modality == 'flair':
             simg_3d = torch.clamp(simg_3d / 255.0, 0.0, 1.0)
 
-        # Step 2: FCD appearance augmentations (synthetic branch only)
         choices = self._parse_aug_choices(aug_type)
         aug_img, rroi_3d = self._apply_fcd_augmentations(simg_3d.clone(), rroi_3d, choices, aug_params)
 
-        # Step 3: Debug NIfTI save — fires once per aug_type
         self._maybe_save_aug_sample(aug_img, rroi_3d, aug_type)
 
-        # Step 4: Standalone IntensityTransform (bias field, gamma, noise, resolution)
-        aug_out        = self.intensity_aug(aug_img.float().unsqueeze(0))
+        aug_out = self.intensity_aug(aug_img.float().unsqueeze(0))
         aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
 
-        # Step 5: Fuse FCD lesion (ROI → class 6) into both label maps
         slab_with_fcd = slab_3d.clone()
         slab_with_fcd[rroi_3d > 0] = 6
 
@@ -858,10 +892,10 @@ class Model(pl.LightningModule):
         rlab_with_fcd[rroi_3d > 0] = 6
 
         return (
-            aug_image_item,              # (1, D, H, W)  synthetic FLAIR — normalized [0,1]
-            slab_with_fcd.unsqueeze(0),  # (1, D, H, W)  synthetic target {0–6}
-            rimg.float(),                # (1, D, H, W)  real FLAIR — raw scale [~0, 245]
-            rlab_with_fcd.unsqueeze(0),  # (1, D, H, W)  real target {0–6}
+            aug_image_item,
+            slab_with_fcd.unsqueeze(0),
+            rimg.float(),
+            rlab_with_fcd.unsqueeze(0),
         )
 
     def synthesize_batch(self, batch: dict):
