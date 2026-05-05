@@ -17,7 +17,7 @@ import cornucopia as cc
 import pandas as pd
 
 
-def donothing(x):
+def do_nothing(x):
     return x
 
 
@@ -297,7 +297,7 @@ class SynthFromLabelTransform(torch.nn.Module):
             self.gmm = RandomGaussianMixtureTransform(fwhm=gmm_fwhm, background=0)
 
         # ── Post-GMM intensity augmentation ───────────────────────────────────
-        self.intensity = donothing if no_augs else cc.IntensityTransform(
+        self.intensity = do_nothing if no_augs else cc.IntensityTransform(
             bias, gamma, motion_fwhm, resolution, snr, gfactor, order,
         )
 
