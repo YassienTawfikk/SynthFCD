@@ -1432,6 +1432,8 @@ class CLI(LightningCLI):
             "checkpoint.filename": "checkpoint-{epoch:02d}-{eval_loss:.2f}-{val_dice:.2f}",
             "checkpoint.every_n_epochs": 1,
         })
+        parser.link_arguments("model.native_synthesis", "data.native_synthesis")
+
 
     def instantiate_trainer(self, **kwargs):
         run_name = os.environ.get(
