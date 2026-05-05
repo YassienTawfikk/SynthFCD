@@ -122,9 +122,9 @@ class FCDDataset(Dataset):
         self._calc = FCDParameterCalculator()
 
         # Normalise fused_paths — None list when not native_synthesis
-        if fused_paths is None:
+        if not fused_paths:
             fused_paths = [None] * len(label_paths)
-
+        
         for label_path, flair_path, roi_path, fused_path in zip(label_paths, flair_paths, roi_paths, fused_paths):
             subject_num = self._calc.get_subj_num(os.path.dirname(label_path))
             aug_matches = []
@@ -202,6 +202,7 @@ class FCDDataset(Dataset):
             item['fusedmask_t'] = torch.as_tensor(fused_arr, dtype=torch.int64).unsqueeze(0)
 
         return item
+
 
 # ── FCDDataModule ─────────────────────────────────────────────────────────────
 #
@@ -492,19 +493,38 @@ class SharedSynth(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _forward_standard(self, slab, img, lab, roi):
-        """Cornucopia path — full deformation + GMM + intensity. Used when flair_modality = False."""
-        final = self.synth.make_final(slab, 1)
-        final.deform = final.deform.make_final(slab)
-        simg, slab = final(slab)
+        """Cornucopia path — full deformation + GMM + intensity. Used when modality != 'flair'.
+
+        native_synthesis=True : label 21 pre-remapped to 2 (cortex) before cornucopia synthesis
+                                so the shared GMM assigns cortex-like intensities to lesion voxels.
+                                Deformed lab (still has 21) is remapped via remap_labels → class 6.
+        """
+        # Pre-remap label 21 → 2 before cornucopia — avoids out-of-range label and ensures
+        # the shared GMM samples cortex-like intensities at lesion voxels
+        if self.native_synthesis:
+            slab_synth = slab.clone()
+            slab_synth[slab_synth == 21] = 2
+        else:
+            slab_synth = slab
+
+        final = self.synth.make_final(slab_synth, 1)
+        final.deform = final.deform.make_final(slab_synth)
+        simg, slab_out = final(slab_synth)
 
         if roi is not None:
             rimg, rlab, rroi = final.deform([img, lab, roi])
             rlab = final.postproc(rlab)
-            return simg, slab, rimg, rlab, rroi
+            return simg, slab_out, rimg, rlab, rroi
         else:
             rimg, rlab = final.deform([img, lab])
-            rlab = final.postproc(rlab)
-            return simg, slab, rimg, rlab, None
+            if self.native_synthesis:
+                # rlab is deformed fusedmask — label 21 still intact after deformation
+                # remap_labels maps 21 → class 6 for both synthetic and real targets
+                slab_out = self.remap_labels(rlab)
+                rlab_out = self.remap_labels(rlab)
+            else:
+                rlab_out = final.postproc(rlab)
+            return simg, slab_out, rimg, rlab_out, None
 
     def _forward_custom(self, slab, img, lab, roi):
         """FLAIR path — deformation + per-class GMM. IntensityTransform applied downstream.
@@ -571,9 +591,11 @@ class SharedSynth(torch.nn.Module):
 
         return torch.clamp(lut[label_map.long()], 0, nb_classes - 1)
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Model  —  6-class grouped segmentation (brain structures + FCD lesion)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class Model(pl.LightningModule):
     # ── Class-level label definitions — single source of truth ───────────────
@@ -662,7 +684,7 @@ class Model(pl.LightningModule):
         print(f"  seg_norm        : {self.hparams.seg_norm}")
         print(f"  nb_classes      : {self.hparams.nb_classes}")
         modality = "Flair" if self.hparams.flair_modality else "Random Modality"
-        print(f"  modality        : '{modality}'")
+        print(f"  modality        : {modality}")
 
         total_params = sum(p.numel() for p in seg.parameters())
         trainable = sum(p.numel() for p in seg.parameters() if p.requires_grad)
@@ -1080,6 +1102,8 @@ class Model(pl.LightningModule):
         return self.network.segnet(x)
 
 
+
+
 # ── Helper Functions ──────────────────────────────────────────────────────────
 
 def save(dat, fname):
@@ -1245,7 +1269,6 @@ class LossGraphCallback(Callback):
 
             fig, ax1 = plt.subplots(figsize=(11, 6))
 
-            # Loss axis
             if "train_loss" in epoch_metrics:
                 ax1.plot(
                     epoch_metrics.index,
@@ -1272,7 +1295,6 @@ class LossGraphCallback(Callback):
             ax1.set_ylim(bottom=0)
             ax1.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.6)
 
-            # Dice axis
             ax2 = ax1.twinx()
 
             if "val_dice" in epoch_metrics:
@@ -1432,7 +1454,7 @@ class CLI(LightningCLI):
             "checkpoint.filename": "checkpoint-{epoch:02d}-{eval_loss:.2f}-{val_dice:.2f}",
             "checkpoint.every_n_epochs": 1,
         })
-        parser.link_arguments("model.native_synthesis", "data.native_synthesis")
+        parser.link_arguments("model.native_synthesis", "data.native_synthesis")  # ← add
 
 
     def instantiate_trainer(self, **kwargs):
