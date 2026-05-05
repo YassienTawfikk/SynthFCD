@@ -32,6 +32,8 @@ import cornucopia as cc
 from cornucopia import SynthFromLabelTransform, IntensityTransform
 from cornucopia.special import IdentityTransform
 
+from learn2synth.optim import required
+
 # NOTE: GaussianSmooth is currently unused → remove if not needed
 # from monai.transforms import GaussianSmooth
 
@@ -216,6 +218,7 @@ class FCDDataModule(pl.LightningDataModule):
                  batch_size: int = 1,
                  shuffle: bool = True,
                  num_workers: int = 4,
+                 native_synthesis: bool = False,
                  train_subdir: str = 'train',
                  raw_subdir: Optional[str] = 'raw',
                  extra_subdirs: Optional[list] = None,
@@ -230,11 +233,10 @@ class FCDDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
+        self.native_synthesis = native_synthesis
         self.use_extra_data = use_extra_data
 
         # --- Resolve directory layout ---
-        # If raw_subdir is None, data lives directly in train_subdir — no subfolders,
-        # no extra data possible, so use_extra_data is forced False.
         if raw_subdir is None:
             self.use_extra_data = False
             self.val_from_raw_only = False
@@ -246,58 +248,66 @@ class FCDDataModule(pl.LightningDataModule):
         raw_root = train_root if raw_subdir is None else path.join(train_root, raw_subdir)
         extra_roots = [path.join(train_root, s) for s in extra_subdirs] if extra_subdirs else []
 
-        # --- Helper: scan one directory for valid (label, flair, roi) triplets ---
+        # --- Helper: scan one directory for valid triplets (+ fusedmask when native_synthesis) ---
         def _scan(root: str) -> tuple:
             subject_folders = sorted(glob.glob(path.join(root, 'sub-*')))
-            label_paths, flair_paths, roi_paths = [], [], []
+            label_paths, flair_paths, roi_paths, fused_paths = [], [], [], []
             dropped = 0
             for subject_dir in subject_folders:
                 label_path = path.join(subject_dir, label_file)
                 flair_path = path.join(subject_dir, flair_file)
-                roi_path = path.join(subject_dir, roi_file)
-                if all(path.exists(x) for x in [label_path, flair_path, roi_path]):
+                roi_path   = path.join(subject_dir, roi_file)
+                fused_path = path.join(subject_dir, fusedmask_file)
+
+                required = [label_path, flair_path, roi_path]
+                if self.native_synthesis:
+                    required.append(fused_path)
+                if all(path.exists(x) for x in required):
                     label_paths.append(label_path)
                     flair_paths.append(flair_path)
                     roi_paths.append(roi_path)
+                    if self.native_synthesis:
+                        fused_paths.append(fused_path)
                 else:
                     dropped += 1
             if dropped:
                 print(f"[FCDDataModule] WARNING: {dropped} incomplete triplets dropped in {root}")
             else:
                 print(f"[FCDDataModule] {len(label_paths)} subjects loaded from {root}")
-            return label_paths, flair_paths, roi_paths
+            return label_paths, flair_paths, roi_paths, fused_paths
 
         # --- Scan raw (val-eligible) subjects ---
-        raw_label_paths, raw_flair_paths, raw_roi_paths = _scan(raw_root)
+        raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = _scan(raw_root)
         assert len(raw_label_paths) > 0, (
             f"[FCDDataModule] Fatal: 0 valid triplets in '{raw_root}'. "
             "Check path and file names."
         )
 
         # --- Scan extra (train-only) subjects ---
-        extra_label_paths, extra_flair_paths, extra_roi_paths = [], [], []
+        extra_label_paths, extra_flair_paths, extra_roi_paths, extra_fused_paths = [], [], [], []
         if not self.use_extra_data:
             print("[FCDDataModule] use_extra_data=False — training on raw subjects only.")
         else:
             for extra_root in extra_roots:
                 if path.isdir(extra_root):
-                    e_labels, e_flairs, e_rois = _scan(extra_root)
+                    e_labels, e_flairs, e_rois, e_fused = _scan(extra_root)
                     extra_label_paths.extend(e_labels)
                     extra_flair_paths.extend(e_flairs)
                     extra_roi_paths.extend(e_rois)
+                    extra_fused_paths.extend(e_fused)  # ← fixed
                 else:
                     print(f"[FCDDataModule] NOTE: extra subdir not found, skipping: {extra_root}")
 
         # --- Store split-ready pools ---
-        # _raw_*   → split into val (first eval_frac) + train-raw (remainder)
-        # _extra_* → always training only
         self._raw_label_paths = raw_label_paths
         self._raw_flair_paths = raw_flair_paths
         self._raw_roi_paths = raw_roi_paths
+        self._raw_fused_paths = raw_fused_paths
 
         self._extra_label_paths = extra_label_paths
         self._extra_flair_paths = extra_flair_paths
         self._extra_roi_paths = extra_roi_paths
+        self._extra_fused_paths = extra_fused_paths
 
         print(
             f"[FCDDataModule] Source summary: "
@@ -305,20 +315,22 @@ class FCDDataModule(pl.LightningDataModule):
             f"→ val pool = raw only ({len(raw_label_paths)} subjects)"
         )
 
-        # --- Compute FCD augmentation parameters from raw subjects only ---
-        # Generated subjects have synthetic labels that may not reflect the
-        # real intensity statistics expected by FCDParameterCalculator.
-        print("[FCDDataModule] Computing FCD augmentation parameters…")
-        self._calc = FCDParameterCalculator()
-        self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(            
-            dataset_path=raw_root,
-            label_file=label_file,
-            flair_file=flair_file,
-            roi_file=roi_file,
-            intensity_subjects=INTENSITY_SUBJECTS,
-            transmantle_subjects=TRANSMANTLE_SUBJECTS,
-            auto_resample=True,
-        )
+        if not self.native_synthesis:
+            print("[FCDDataModule] Computing FCD augmentation parameters…")
+            self._calc = FCDParameterCalculator()
+            self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(
+                dataset_path=raw_root,
+                label_file=label_file,
+                flair_file=flair_file,
+                roi_file=roi_file,
+                intensity_subjects=INTENSITY_SUBJECTS,
+                transmantle_subjects=TRANSMANTLE_SUBJECTS,
+                auto_resample=True,
+            )
+        else:
+            print("[FCDDataModule] native_synthesis=True — skipping FCD augmentation parameter computation.")
+            self.fcd_intensity_range = (0.0, 0.0)
+            self.fcd_tail_range = (0, 0)
 
     def setup(self, stage=None):
         if hasattr(self, '_setup_done'):
@@ -329,11 +341,12 @@ class FCDDataModule(pl.LightningDataModule):
         raw_label_paths = list(self._raw_label_paths)
         raw_flair_paths = list(self._raw_flair_paths)
         raw_roi_paths = list(self._raw_roi_paths)
+        raw_fused_paths = list(self._raw_fused_paths)
 
         if self.preshuffle:
-            combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths))
+            combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths))
             shuffle(combined)
-            raw_label_paths, raw_flair_paths, raw_roi_paths = map(list, zip(*combined))
+            raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
 
         def _count(param, total):
             if isinstance(param, float): return int(math.ceil(total * param))
@@ -346,15 +359,18 @@ class FCDDataModule(pl.LightningDataModule):
         val_label_paths = raw_label_paths[:n_val]
         val_flair_paths = raw_flair_paths[:n_val]
         val_roi_paths = raw_roi_paths[:n_val]
+        val_fused_paths = raw_fused_paths[:n_val]  # ← fixed
 
         train_raw_label_paths = raw_label_paths[n_val:]
         train_raw_flair_paths = raw_flair_paths[n_val:]
         train_raw_roi_paths = raw_roi_paths[n_val:]
+        train_raw_fused_paths = raw_fused_paths[n_val:]  # ← fixed
 
-        # Training set = remaining raw + all extra (empty list if use_extra_data=False)
+        # Training set = remaining raw + all extra
         train_label_paths = train_raw_label_paths + list(self._extra_label_paths)
         train_flair_paths = train_raw_flair_paths + list(self._extra_flair_paths)
         train_roi_paths = train_raw_roi_paths + list(self._extra_roi_paths)
+        train_fused_paths = train_raw_fused_paths + list(self._extra_fused_paths)  # ← fixed
 
         print(
             f"[FCDDataModule] Split: "
@@ -367,8 +383,18 @@ class FCDDataModule(pl.LightningDataModule):
             fcd_tail_length_range=self.fcd_tail_range,
         )
 
-        self.train_ds = FCDDataset(self.ndim, train_label_paths, train_flair_paths, train_roi_paths, **kw)
-        self.eval_ds = FCDDataset(self.ndim, val_label_paths, val_flair_paths, val_roi_paths, **kw)
+        self.train_ds = FCDDataset(
+            self.ndim, train_label_paths, train_flair_paths, train_roi_paths,
+            fused_paths=train_fused_paths,
+            native_synthesis=self.native_synthesis,
+            **kw,
+        )
+        self.eval_ds = FCDDataset(
+            self.ndim, val_label_paths, val_flair_paths, val_roi_paths,
+            fused_paths=val_fused_paths,
+            native_synthesis=self.native_synthesis,
+            **kw,
+        )
 
     def train_dataloader(self):
         return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=self.shuffle, num_workers=self.num_workers, pin_memory=True,
