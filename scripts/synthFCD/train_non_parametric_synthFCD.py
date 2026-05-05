@@ -492,7 +492,7 @@ class SharedSynth(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _forward_standard(self, slab, img, lab, roi):
-        """Cornucopia path — full deformation + GMM + intensity. Used when modality != 'flair'."""
+        """Cornucopia path — full deformation + GMM + intensity. Used when flair_modality = False."""
         final = self.synth.make_final(slab, 1)
         final.deform = final.deform.make_final(slab)
         simg, slab = final(slab)
@@ -599,7 +599,7 @@ class Model(pl.LightningModule):
             optimizer: str = 'Adam',
             optimizer_options: Optional[dict] = None,
             time_limit_minutes: float = None,
-            modality: str = 'random',
+            flair_modality: bool = False,
             flair_stats_csv: Optional[str] = FLAIR_STATS_CSV,
             n_best_batches: int = 2,
             native_synthesis: bool = False,
@@ -622,7 +622,7 @@ class Model(pl.LightningModule):
         # ── Sub-modules ───────────────────────────────────────────────────────
         self.subject_params_cache   = self._load_subject_params()
         seg_net                     = self._build_seg_network(ndim, nb_classes, seg_features,seg_activation, seg_nb_levels, seg_nb_conv, seg_norm)
-        synth                       = self._build_synth(modality)
+        synth                       = self._build_synth(flair_modality)
         loss_fn                     = self._build_loss(loss)
         self.network                = SynthSeg(seg_net, synth, loss_fn)
         self.intensity_aug          = self._build_intensity_aug()
@@ -661,23 +661,30 @@ class Model(pl.LightningModule):
         print(f"  seg_nb_conv     : {self.hparams.seg_nb_conv}")
         print(f"  seg_norm        : {self.hparams.seg_norm}")
         print(f"  nb_classes      : {self.hparams.nb_classes}")
-        print(f"  modality        : '{self.hparams.modality}'")
+        modality = "Flair" if self.hparams.flair_modality else "Random Modality"
+        print(f"  modality        : '{modality}'")
+
         total_params = sum(p.numel() for p in seg.parameters())
         trainable = sum(p.numel() for p in seg.parameters() if p.requires_grad)
         print(f"  Total params    : {total_params:,}")
         print(f"  Trainable params: {trainable:,}")
 
         # ── Synthesis Pipeline ────────────────────────────────────────────────
-        print("\nDEBUG: Synthesis Pipeline")
+        approach = "Native SynthSeg Approach" if self.hparams.native_synthesis else "SynthFCD Approach"
+        print(f"\nDEBUG: Synthesis Pipeline  [{approach}]")
         print("─" * 60)
         print(f"  SharedSynth.synth type : {type(self.network.synth.synth).__name__}")
         gmm = getattr(self.network.synth.synth, 'gmm', None)
         print(f"  GMM type               : {type(gmm).__name__ if gmm else 'None'}")
         print(f"  GMM class_params keys  : {sorted(gmm.class_params.keys()) if gmm and hasattr(gmm, 'class_params') else 'N/A'}")
         print(f"  IntensityAug type      : {type(self.intensity_aug).__name__}")
-        print(f"  FCDAugmentations       : {type(self.fcd_aug).__name__}")
         print(f"  Subject params cached  : {len(self.subject_params_cache)} subjects")
 
+        if self.hparams.native_synthesis:
+            print(f"  Lesion GMM (class 21)  : {self.lesion_gmm_params}  [injected per-step]")
+            print(f"  FCDAugmentations       : disabled  [native path — GMM handles lesion appearance]")
+        else:
+            print(f"  FCDAugmentations       : {type(self.fcd_aug).__name__}")
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Private builders  (called only from __init__)
@@ -718,8 +725,8 @@ class Model(pl.LightningModule):
                         nb_levels=nb_levels, nb_conv=nb_conv, norm=norm)
         return SegNet(ndim, 1, nb_classes, backbone=backbone, activation=None)
 
-    def _build_synth(self, modality: str) -> SharedSynth:
-        if modality == 'flair':
+    def _build_synth(self, flair_modality: bool) -> SharedSynth:
+        if flair_modality:
             raw = CustomSynthFromLabelTransform(
                 num_ch=1, class_params=FLAIR_CLASS_PARAMS, use_per_class_gmm=True,
                 gmm_fwhm=10, bias=7, gamma=0.5, motion_fwhm=2.0, resolution=3,
@@ -766,7 +773,7 @@ class Model(pl.LightningModule):
             if subject_id and subject_id in self.subject_params_cache
             else FLAIR_CLASS_PARAMS
         )
-        if self.hparams.modality == 'flair':
+        if self.hparams.flair_modality:
             if self.hparams.native_synthesis:
                 params = dict(params)  # shallow copy — don't mutate the cache
                 params[21] = self.lesion_gmm_params
@@ -830,22 +837,16 @@ class Model(pl.LightningModule):
         aug_type   = batch['aug_type'][i]
         subject_id = batch.get('subject_id', [None] * len(batch['label_t']))[i]
 
-        aug_params = {
-            'int_rng':     (batch['int_factor_min'][i].item(),  batch['int_factor_max'][i].item()),
-            'blur_sigma':  (batch['blur_sigma_min'][i].item(),  batch['blur_sigma_max'][i].item()),
-            'zoom_f':      (batch['zoom_f_min'][i].item(),      batch['zoom_f_max'][i].item()),
-            'hyper_sigma': (batch['hyper_sigma_min'][i].item(), batch['hyper_sigma_max'][i].item()),
-            'trans_sigma': (batch['trans_sigma_min'][i].item(), batch['trans_sigma_max'][i].item()),
-        }
-
-        if label_t.sum() == 0 or torch.isnan(label_t.float()).any():
+        # Validate the actual synthesis input — fusedmask on native path, labelmap otherwise
+        input_t = batch['fusedmask_t'][i] if self.hparams.native_synthesis else label_t
+        if input_t.sum() == 0 or torch.isnan(input_t.float()).any():
             return None
 
         self._set_subject_params(subject_id)
 
         # ── Native synthesis path ─────────────────────────────────────────────────
         if self.hparams.native_synthesis:
-            fusedmask_t = batch['fusedmask_t'][i]
+            fusedmask_t = input_t  # already extracted above
 
             # fusedmask acts as both slab (GMM input) and lab (real branch label target)
             # roi omitted — lesion is already encoded as label 21 in fusedmask
@@ -854,7 +855,7 @@ class Model(pl.LightningModule):
             )
             simg_3d = simg.squeeze(0).float()
 
-            if self.hparams.modality == 'flair':
+            if self.hparams.flair_modality:
                 simg_3d = torch.clamp(simg_3d / 255.0, 0.0, 1.0)
 
             aug_out = self.intensity_aug(simg_3d.unsqueeze(0))
@@ -869,12 +870,19 @@ class Model(pl.LightningModule):
             )
 
         # ── Augmented synthesis path (original) ───────────────────────────────────
+        aug_params = {
+            'int_rng':     (batch['int_factor_min'][i].item(),  batch['int_factor_max'][i].item()),
+            'blur_sigma':  (batch['blur_sigma_min'][i].item(),  batch['blur_sigma_max'][i].item()),
+            'zoom_f':      (batch['zoom_f_min'][i].item(),      batch['zoom_f_max'][i].item()),
+            'hyper_sigma': (batch['hyper_sigma_min'][i].item(), batch['hyper_sigma_max'][i].item()),
+            'trans_sigma': (batch['trans_sigma_min'][i].item(), batch['trans_sigma_max'][i].item()),
+        }
         simg, slab, rimg, rlab, rroi = self.network.synth(label_t, flair_t, label_t, roi_t)
         simg_3d = simg.squeeze(0).float()
         slab_3d = slab.squeeze(0).long()
         rroi_3d = (rroi.squeeze(0) > 0).long()
 
-        if self.hparams.modality == 'flair':
+        if self.hparams.flair_modality:
             simg_3d = torch.clamp(simg_3d / 255.0, 0.0, 1.0)
 
         choices = self._parse_aug_choices(aug_type)
