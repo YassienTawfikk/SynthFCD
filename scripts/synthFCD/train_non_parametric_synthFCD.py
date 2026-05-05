@@ -434,16 +434,16 @@ class SharedSynth(torch.nn.Module):
     Synthetic branch: label map → one-hot → GMM → synthetic FLAIR image
     Real branch:      FLAIR + label + ROI passed through unchanged (no_augs=True)
 
-    Geometric deformation is disabled (no_augs=True in CustomSynthFromLabelTransform).
     IntensityTransform is intentionally excluded — applied downstream after FCD augmentations.
     """
 
     N_CLASSES = 18  # valid labels are 0..18 inclusive (19 values)
 
-    def __init__(self, synth, target_labels=None):
+    def __init__(self, synth, target_labels=None, native_synthesis: bool = False):
         super().__init__()
         self.synth = synth
         self.target_labels = target_labels or []
+        self.native_synthesis = native_synthesis
 
     # ------------------------------------------------------------------
     # Public API
@@ -457,7 +457,7 @@ class SharedSynth(torch.nn.Module):
         else:
             print('[SharedSynth] Warning: set_class_params called but no GMM found.')
 
-    def forward(self, slab, img, lab, roi):
+    def forward(self, slab, img, lab, roi=None):
         """
         Parameters
         ----------
@@ -488,57 +488,50 @@ class SharedSynth(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _forward_standard(self, slab, img, lab, roi):
-        """
-        Legacy path — cornucopia SynthFromLabelTransform.
-        Applies geometric deformation to all inputs using a shared random field.
-        Used when modality != 'flair'.
-        """
+        """Cornucopia path — full deformation + GMM + intensity. Used when modality != 'flair'."""
         final = self.synth.make_final(slab, 1)
         final.deform = final.deform.make_final(slab)
-
         simg, slab = final(slab)
-        rimg, rlab, rroi = final.deform([img, lab, roi])
-        rlab = final.postproc(rlab)
 
-        return simg, slab, rimg, rlab, rroi
+        if roi is not None:
+            rimg, rlab, rroi = final.deform([img, lab, roi])
+            rlab = final.postproc(rlab)
+            return simg, slab, rimg, rlab, rroi
+        else:
+            rimg, rlab = final.deform([img, lab])
+            rlab = final.postproc(rlab)
+            return simg, slab, rimg, rlab, None
 
     def _forward_custom(self, slab, img, lab, roi):
+        """FLAIR path — deformation + per-class GMM. IntensityTransform applied downstream.
+
+        native_synthesis=False : slab is labelmap (labels 0..18), roi co-deformed separately.
+        native_synthesis=True  : slab is fusedmask (labels 0..18 + 21), roi absent — lesion
+                                 already encoded as label 21 and remapped to class 6.
         """
-        FLAIR path — CustomSynthFromLabelTransform (no_augs=True).
-
-        No geometric deformation is applied (disabled via no_augs=True).
-        GMM samples per-class FLAIR intensities from the one-hot label map.
-        IntensityTransform inside the synth is also disabled (donothing) —
-        it is applied downstream after FCD augmentations.
-
-        slab is remapped directly (not via one-hot round-trip) since
-        no_augs=True means slab_oh.argmax() == slab anyway.
-        """
-        oh_slab = self._to_one_hot(slab)
-
-        # synth applies GMM only (no deform, no intensity)
-        # coreg=[img, lab, roi] passes real-branch inputs through unchanged
-        simg, _, (rimg, rlab, rroi) = self.synth(oh_slab, coreg=[img, lab, roi])
-
-        # Remap both label maps from sparse 0..18 → consecutive 0..5
-        slab_out = self.remap_labels(slab)
-        rlab_out = self.remap_labels(rlab)
-
-        return simg, slab_out, rimg, rlab_out, rroi
-
+        if roi is not None:
+            oh_slab = self._to_one_hot(slab)  # (19, D, H, W)
+            simg, _, (rimg, rlab, rroi) = self.synth(oh_slab, coreg=[img, lab, roi])
+            slab_out = self.remap_labels(slab)
+            rlab_out = self.remap_labels(rlab)
+            return simg, slab_out, rimg, rlab_out, rroi
+        else:
+            oh_slab = self._to_one_hot(slab, num_classes=22)  # (22, D, H, W) — label 21 gets its own channel
+            simg, _, (rimg, rlab) = self.synth(oh_slab, coreg=[img, lab])
+            slab_out = self.remap_labels(slab)
+            rlab_out = self.remap_labels(rlab)
+            return simg, slab_out, rimg, rlab_out, None
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _to_one_hot(self, label_map: torch.Tensor) -> torch.Tensor:
-        """
-        Convert integer label map → one-hot float tensor (C, D, H, W).
-        num_classes = N_CLASSES + 1 = 19 to accommodate labels 0..18 inclusive.
-        """
+    def _to_one_hot(self, label_map: torch.Tensor, num_classes: int = None) -> torch.Tensor:
+        if num_classes is None:
+            num_classes = self.N_CLASSES + 1  # default: 19, covers labels 0..18
         return (
             torch.nn.functional.one_hot(
                 label_map.long().squeeze(0),
-                num_classes=self.N_CLASSES + 1  # 19: covers labels 0..18
+                num_classes=num_classes
             )
             .permute(3, 0, 1, 2)
             .float()
@@ -555,6 +548,7 @@ class SharedSynth(torch.nn.Module):
             label 3  → class 3 (Deep Gray Matter)
             label 4  → class 4 (CSF)
             label 18 → class 5 (WM-GM Separator)
+            label 21 → class 6 (FCD Lesion)  [native_synthesis path only]
             all else → class 0 (Background)
         """
         max_value = int(label_map.max().item()) + 1
@@ -565,7 +559,12 @@ class SharedSynth(torch.nn.Module):
                 if value < max_value:
                     lut[value] = class_index
 
+        if self.native_synthesis and 21 < max_value:
+            lut[21] = 6  # FCD lesion remapped from fusedmask label 21
         nb_classes = len(self.target_labels) + 1  # 6: background + 5 tissues
+        if self.native_synthesis:
+            nb_classes += 1  # +1 to accommodate class 6 (FCD lesion)
+
         return torch.clamp(lut[label_map.long()], 0, nb_classes - 1)
 
 # ══════════════════════════════════════════════════════════════════════════════
