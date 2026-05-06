@@ -797,8 +797,9 @@ class Model(pl.LightningModule):
         )
         if self.hparams.flair_modality:
             if self.hparams.native_synthesis:
-                params = dict(params)  # shallow copy — don't mutate the cache
-                params[21] = self.lesion_gmm_params
+                params = dict(params)
+                if 21 not in params:   # only uses lesion_gmm_params as fallback if 21 not in CSV
+                    params[21] = self.lesion_gmm_params
             self.network.synth.set_class_params(params)
 
     # ══════════════════════════════════════════════════════════════════════════
