@@ -84,6 +84,8 @@ class FCDDataset(Dataset):
             label_paths,
             flair_paths,
             roi_paths,
+            fused_paths=None,
+            native_synthesis: bool = False,
             fcd_intensity_range=(0.02, 0.3602),
             fcd_tail_length_range=(20, 50),
             blur_sigma_range=(0.7, 1.7),
@@ -103,6 +105,8 @@ class FCDDataset(Dataset):
             trans_sigma_range: Range for transmantle signal intensity noise.
         """
         self.ndim = ndim
+        self.native_synthesis = native_synthesis
+
         self.fcd_intensity_range = fcd_intensity_range
         self.fcd_tail_length_range = fcd_tail_length_range
 
@@ -117,7 +121,11 @@ class FCDDataset(Dataset):
         # Initialize stateless utility once to minimize instantiation overhead during loading
         self._calc = FCDParameterCalculator()
 
-        for label_path, flair_path, roi_path in zip(label_paths, flair_paths, roi_paths):
+        # Normalise fused_paths — None list when not native_synthesis
+        if not fused_paths:
+            fused_paths = [None] * len(label_paths)
+        
+        for label_path, flair_path, roi_path, fused_path in zip(label_paths, flair_paths, roi_paths, fused_paths):
             subject_num = self._calc.get_subj_num(os.path.dirname(label_path))
             aug_matches = []
 
@@ -128,13 +136,13 @@ class FCDDataset(Dataset):
             if subject_num in TRANSMANTLE_SUBJECTS: aug_matches.append('trans')
 
             aug_type = '+'.join(aug_matches) if aug_matches else 'combo'
-            self.items.append((label_path, flair_path, roi_path, aug_type))
+            self.items.append((label_path, flair_path, roi_path, fused_path, aug_type))
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, idx):
-        label_path, flair_path, roi_path, aug_type = self.items[idx]
+        label_path, flair_path, roi_path, fused_path, aug_type = self.items[idx]
 
         # --- Volume Loading (I/O) ---
         flair_arr = nib.load(flair_path).get_fdata()
@@ -176,7 +184,7 @@ class FCDDataset(Dataset):
             'trans_sigma_max': torch.tensor(self.trans_sigma_range[1], dtype=torch.float32),
         }
 
-        return {
+        item = {
             'label_t': label_tensor,
             'flair_t': flair_tensor,
             'roi_t': roi_tensor,
@@ -184,6 +192,17 @@ class FCDDataset(Dataset):
             'subject_id': os.path.basename(os.path.dirname(label_path)),
             **aug_params,
         }
+
+        # --- Fused mask (native_synthesis path only) ---
+        if self.native_synthesis:
+            fused_arr = nib.load(fused_path).get_fdata().astype(int)
+            if flair_arr.shape != fused_arr.shape:
+                fused_arr = self._calc.resample_to_target(
+                    fused_arr, flair_arr.shape, True).astype(int)
+            item['fusedmask_t'] = torch.as_tensor(fused_arr, dtype=torch.int64).unsqueeze(0)
+
+        return item
+
 
 # ── FCDDataModule ─────────────────────────────────────────────────────────────
 #
@@ -216,6 +235,7 @@ class FCDDataModule(pl.LightningDataModule):
                  batch_size: int = 1,
                  shuffle: bool = True,
                  num_workers: int = 4,
+                 native_synthesis: bool = False,
                  train_subdir: str = 'train',
                  raw_subdir: Optional[str] = 'raw',
                  extra_subdirs: Optional[list] = None,
@@ -230,11 +250,10 @@ class FCDDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
+        self.native_synthesis = native_synthesis
         self.use_extra_data = use_extra_data
 
         # --- Resolve directory layout ---
-        # If raw_subdir is None, data lives directly in train_subdir — no subfolders,
-        # no extra data possible, so use_extra_data is forced False.
         if raw_subdir is None:
             self.use_extra_data = False
             self.val_from_raw_only = False
@@ -246,58 +265,66 @@ class FCDDataModule(pl.LightningDataModule):
         raw_root = train_root if raw_subdir is None else path.join(train_root, raw_subdir)
         extra_roots = [path.join(train_root, s) for s in extra_subdirs] if extra_subdirs else []
 
-        # --- Helper: scan one directory for valid (label, flair, roi) triplets ---
+        # --- Helper: scan one directory for valid triplets (+ fusedmask when native_synthesis) ---
         def _scan(root: str) -> tuple:
             subject_folders = sorted(glob.glob(path.join(root, 'sub-*')))
-            label_paths, flair_paths, roi_paths = [], [], []
+            label_paths, flair_paths, roi_paths, fused_paths = [], [], [], []
             dropped = 0
             for subject_dir in subject_folders:
                 label_path = path.join(subject_dir, label_file)
                 flair_path = path.join(subject_dir, flair_file)
-                roi_path = path.join(subject_dir, roi_file)
-                if all(path.exists(x) for x in [label_path, flair_path, roi_path]):
+                roi_path   = path.join(subject_dir, roi_file)
+                fused_path = path.join(subject_dir, fusedmask_file)
+
+                required = [label_path, flair_path, roi_path]
+                if self.native_synthesis:
+                    required.append(fused_path)
+                if all(path.exists(x) for x in required):
                     label_paths.append(label_path)
                     flair_paths.append(flair_path)
                     roi_paths.append(roi_path)
+                    if self.native_synthesis:
+                        fused_paths.append(fused_path)
                 else:
                     dropped += 1
             if dropped:
                 print(f"[FCDDataModule] WARNING: {dropped} incomplete triplets dropped in {root}")
             else:
                 print(f"[FCDDataModule] {len(label_paths)} subjects loaded from {root}")
-            return label_paths, flair_paths, roi_paths
+            return label_paths, flair_paths, roi_paths, fused_paths
 
         # --- Scan raw (val-eligible) subjects ---
-        raw_label_paths, raw_flair_paths, raw_roi_paths = _scan(raw_root)
+        raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = _scan(raw_root)
         assert len(raw_label_paths) > 0, (
             f"[FCDDataModule] Fatal: 0 valid triplets in '{raw_root}'. "
             "Check path and file names."
         )
 
         # --- Scan extra (train-only) subjects ---
-        extra_label_paths, extra_flair_paths, extra_roi_paths = [], [], []
+        extra_label_paths, extra_flair_paths, extra_roi_paths, extra_fused_paths = [], [], [], []
         if not self.use_extra_data:
             print("[FCDDataModule] use_extra_data=False — training on raw subjects only.")
         else:
             for extra_root in extra_roots:
                 if path.isdir(extra_root):
-                    e_labels, e_flairs, e_rois = _scan(extra_root)
+                    e_labels, e_flairs, e_rois, e_fused = _scan(extra_root)
                     extra_label_paths.extend(e_labels)
                     extra_flair_paths.extend(e_flairs)
                     extra_roi_paths.extend(e_rois)
+                    extra_fused_paths.extend(e_fused)  # ← fixed
                 else:
                     print(f"[FCDDataModule] NOTE: extra subdir not found, skipping: {extra_root}")
 
         # --- Store split-ready pools ---
-        # _raw_*   → split into val (first eval_frac) + train-raw (remainder)
-        # _extra_* → always training only
         self._raw_label_paths = raw_label_paths
         self._raw_flair_paths = raw_flair_paths
         self._raw_roi_paths = raw_roi_paths
+        self._raw_fused_paths = raw_fused_paths
 
         self._extra_label_paths = extra_label_paths
         self._extra_flair_paths = extra_flair_paths
         self._extra_roi_paths = extra_roi_paths
+        self._extra_fused_paths = extra_fused_paths
 
         print(
             f"[FCDDataModule] Source summary: "
@@ -305,20 +332,22 @@ class FCDDataModule(pl.LightningDataModule):
             f"→ val pool = raw only ({len(raw_label_paths)} subjects)"
         )
 
-        # --- Compute FCD augmentation parameters from raw subjects only ---
-        # Generated subjects have synthetic labels that may not reflect the
-        # real intensity statistics expected by FCDParameterCalculator.
-        print("[FCDDataModule] Computing FCD augmentation parameters…")
-        self._calc = FCDParameterCalculator()
-        self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(            
-            dataset_path=raw_root,
-            label_file=label_file,
-            flair_file=flair_file,
-            roi_file=roi_file,
-            intensity_subjects=INTENSITY_SUBJECTS,
-            transmantle_subjects=TRANSMANTLE_SUBJECTS,
-            auto_resample=True,
-        )
+        if not self.native_synthesis:
+            print("[FCDDataModule] Computing FCD augmentation parameters…")
+            self._calc = FCDParameterCalculator()
+            self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(
+                dataset_path=raw_root,
+                label_file=label_file,
+                flair_file=flair_file,
+                roi_file=roi_file,
+                intensity_subjects=INTENSITY_SUBJECTS,
+                transmantle_subjects=TRANSMANTLE_SUBJECTS,
+                auto_resample=True,
+            )
+        else:
+            print("[FCDDataModule] native_synthesis=True — skipping FCD augmentation parameter computation.")
+            self.fcd_intensity_range = (0.0, 0.0)
+            self.fcd_tail_range = (0, 0)
 
     def setup(self, stage=None):
         if hasattr(self, '_setup_done'):
@@ -329,11 +358,12 @@ class FCDDataModule(pl.LightningDataModule):
         raw_label_paths = list(self._raw_label_paths)
         raw_flair_paths = list(self._raw_flair_paths)
         raw_roi_paths = list(self._raw_roi_paths)
+        raw_fused_paths = list(self._raw_fused_paths)
 
         if self.preshuffle:
-            combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths))
+            combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths))
             shuffle(combined)
-            raw_label_paths, raw_flair_paths, raw_roi_paths = map(list, zip(*combined))
+            raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
 
         def _count(param, total):
             if isinstance(param, float): return int(math.ceil(total * param))
@@ -346,15 +376,18 @@ class FCDDataModule(pl.LightningDataModule):
         val_label_paths = raw_label_paths[:n_val]
         val_flair_paths = raw_flair_paths[:n_val]
         val_roi_paths = raw_roi_paths[:n_val]
+        val_fused_paths = raw_fused_paths[:n_val]  # ← fixed
 
         train_raw_label_paths = raw_label_paths[n_val:]
         train_raw_flair_paths = raw_flair_paths[n_val:]
         train_raw_roi_paths = raw_roi_paths[n_val:]
+        train_raw_fused_paths = raw_fused_paths[n_val:]  # ← fixed
 
-        # Training set = remaining raw + all extra (empty list if use_extra_data=False)
+        # Training set = remaining raw + all extra
         train_label_paths = train_raw_label_paths + list(self._extra_label_paths)
         train_flair_paths = train_raw_flair_paths + list(self._extra_flair_paths)
         train_roi_paths = train_raw_roi_paths + list(self._extra_roi_paths)
+        train_fused_paths = train_raw_fused_paths + list(self._extra_fused_paths)  # ← fixed
 
         print(
             f"[FCDDataModule] Split: "
@@ -367,8 +400,18 @@ class FCDDataModule(pl.LightningDataModule):
             fcd_tail_length_range=self.fcd_tail_range,
         )
 
-        self.train_ds = FCDDataset(self.ndim, train_label_paths, train_flair_paths, train_roi_paths, **kw)
-        self.eval_ds = FCDDataset(self.ndim, val_label_paths, val_flair_paths, val_roi_paths, **kw)
+        self.train_ds = FCDDataset(
+            self.ndim, train_label_paths, train_flair_paths, train_roi_paths,
+            fused_paths=train_fused_paths,
+            native_synthesis=self.native_synthesis,
+            **kw,
+        )
+        self.eval_ds = FCDDataset(
+            self.ndim, val_label_paths, val_flair_paths, val_roi_paths,
+            fused_paths=val_fused_paths,
+            native_synthesis=self.native_synthesis,
+            **kw,
+        )
 
     def train_dataloader(self):
         return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=self.shuffle, num_workers=self.num_workers, pin_memory=True,
@@ -390,16 +433,16 @@ class SharedSynth(torch.nn.Module):
     Synthetic branch: label map → one-hot → GMM → synthetic FLAIR image
     Real branch:      FLAIR + label + ROI passed through unchanged (no_augs=True)
 
-    Geometric deformation is disabled (no_augs=True in CustomSynthFromLabelTransform).
     IntensityTransform is intentionally excluded — applied downstream after FCD augmentations.
     """
 
     N_CLASSES = 18  # valid labels are 0..18 inclusive (19 values)
 
-    def __init__(self, synth, target_labels=None):
+    def __init__(self, synth, target_labels=None, native_synthesis: bool = False):
         super().__init__()
         self.synth = synth
         self.target_labels = target_labels or []
+        self.native_synthesis = native_synthesis
 
     # ------------------------------------------------------------------
     # Public API
@@ -413,22 +456,28 @@ class SharedSynth(torch.nn.Module):
         else:
             print('[SharedSynth] Warning: set_class_params called but no GMM found.')
 
-    def forward(self, slab, img, lab, roi):
+    def forward(self, slab, img, lab, roi=None):
         """
         Parameters
         ----------
-        slab : (1, D, H, W) int64   — label map 0..18, used for GMM synthesis
-        img  : (1, D, H, W) float32 — real FLAIR, passed through to real branch
-        lab  : (1, D, H, W) int64   — real label map, passed through to real branch
-        roi  : (1, D, H, W) int64   — binary ROI mask, passed through to real branch
+        slab : (1, D, H, W) int64   — label map used for GMM synthesis.
+                                       Standard path: labels 0..18.
+                                       Native path:   labels 0..18 + 21 (fusedmask).
+        img  : (1, D, H, W) float32 — real FLAIR, passed through to real branch.
+        lab  : (1, D, H, W) int64   — real label map, co-deformed with slab.
+                                       Native path: fusedmask passed as both slab and lab.
+        roi  : (1, D, H, W) int64   — binary ROI mask, co-deformed with slab.
+                                       None on native path — lesion location encoded in slab.
 
         Returns
         -------
-        simg     : (1, D, H, W) float32  — synthetic FLAIR from GMM
-        slab_out : (1, D, H, W) int64    — remapped label map {0..5}
-        rimg     : (1, D, H, W) float32  — real FLAIR (unchanged)
-        rlab     : (1, D, H, W) int64    — real label remapped {0..5}
-        rroi     : (1, D, H, W) int64    — ROI mask (unchanged)
+        simg     : (1, D, H, W) float32  — synthetic FLAIR from GMM.
+        slab_out : (1, D, H, W) int64    — remapped label map {0..5} standard path,
+                                           {0..6} native path (label 21 → class 6).
+        rimg     : (1, D, H, W) float32  — real FLAIR, unchanged.
+        rlab     : (1, D, H, W) int64    — real label remapped {0..5} standard path,
+                                           {0..6} native path.
+        rroi     : (1, D, H, W) int64    — ROI mask, unchanged. None on native path.
         """
         img = img.float()
 
@@ -444,57 +493,69 @@ class SharedSynth(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _forward_standard(self, slab, img, lab, roi):
-        """
-        Legacy path — cornucopia SynthFromLabelTransform.
-        Applies geometric deformation to all inputs using a shared random field.
-        Used when modality != 'flair'.
-        """
-        final = self.synth.make_final(slab, 1)
-        final.deform = final.deform.make_final(slab)
+        """Cornucopia path — full deformation + GMM + intensity. Used when modality != 'flair'.
 
-        simg, slab = final(slab)
-        rimg, rlab, rroi = final.deform([img, lab, roi])
-        rlab = final.postproc(rlab)
+        native_synthesis=True : label 21 pre-remapped to 19 before cornucopia synthesis
+                                so the lesion gets its own GMM channel for unique intensity sampling.
+                                Deformed lab (still has 21) is remapped via remap_labels → class 6.
+        """
+        # Pre-remap label 21 → 19 before cornucopia — avoids out-of-range LUT (sized to 19)
+        # and gives the lesion its own GMM channel for unique intensity sampling in simg
+        if self.native_synthesis:
+            slab_synth = slab.clone()
+            slab_synth[slab_synth == 21] = 19
+        else:
+            slab_synth = slab
 
-        return simg, slab, rimg, rlab, rroi
+        final = self.synth.make_final(slab_synth, 1)
+        final.deform = final.deform.make_final(slab_synth)
+        simg, slab_out = final(slab_synth)
+
+        if roi is not None:
+            rimg, rlab, rroi = final.deform([img, lab, roi])
+            rlab = final.postproc(rlab)
+            return simg, slab_out, rimg, rlab, rroi
+        else:
+            rimg, rlab = final.deform([img, lab])
+            if self.native_synthesis:
+                # rlab is deformed fusedmask — label 21 still intact after deformation
+                # remap_labels maps 21 → class 6 for both synthetic and real targets
+                slab_out = self.remap_labels(rlab)
+                rlab_out = self.remap_labels(rlab)
+            else:
+                rlab_out = final.postproc(rlab)
+            return simg, slab_out, rimg, rlab_out, None
 
     def _forward_custom(self, slab, img, lab, roi):
+        """FLAIR path — deformation + per-class GMM. IntensityTransform applied downstream.
+
+        native_synthesis=False : slab is labelmap (labels 0..18), roi co-deformed separately.
+        native_synthesis=True  : slab is fusedmask (labels 0..18 + 21), roi absent — lesion
+                                 already encoded as label 21 and remapped to class 6.
         """
-        FLAIR path — CustomSynthFromLabelTransform (no_augs=True).
-
-        No geometric deformation is applied (disabled via no_augs=True).
-        GMM samples per-class FLAIR intensities from the one-hot label map.
-        IntensityTransform inside the synth is also disabled (donothing) —
-        it is applied downstream after FCD augmentations.
-
-        slab is remapped directly (not via one-hot round-trip) since
-        no_augs=True means slab_oh.argmax() == slab anyway.
-        """
-        oh_slab = self._to_one_hot(slab)
-
-        # synth applies GMM only (no deform, no intensity)
-        # coreg=[img, lab, roi] passes real-branch inputs through unchanged
-        simg, _, (rimg, rlab, rroi) = self.synth(oh_slab, coreg=[img, lab, roi])
-
-        # Remap both label maps from sparse 0..18 → consecutive 0..5
-        slab_out = self.remap_labels(slab)
-        rlab_out = self.remap_labels(rlab)
-
-        return simg, slab_out, rimg, rlab_out, rroi
-
+        if roi is not None:
+            oh_slab = self._to_one_hot(slab)  # (19, D, H, W)
+            simg, _, (rimg, rlab, rroi) = self.synth(oh_slab, coreg=[img, lab, roi])
+            slab_out = self.remap_labels(slab)
+            rlab_out = self.remap_labels(rlab)
+            return simg, slab_out, rimg, rlab_out, rroi
+        else:
+            oh_slab = self._to_one_hot(slab, num_classes=22)  # (22, D, H, W) — label 21 gets its own channel
+            simg, _, (rimg, rlab) = self.synth(oh_slab, coreg=[img, lab])
+            slab_out = self.remap_labels(slab)
+            rlab_out = self.remap_labels(rlab)
+            return simg, slab_out, rimg, rlab_out, None
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _to_one_hot(self, label_map: torch.Tensor) -> torch.Tensor:
-        """
-        Convert integer label map → one-hot float tensor (C, D, H, W).
-        num_classes = N_CLASSES + 1 = 19 to accommodate labels 0..18 inclusive.
-        """
+    def _to_one_hot(self, label_map: torch.Tensor, num_classes: int = None) -> torch.Tensor:
+        if num_classes is None:
+            num_classes = self.N_CLASSES + 1  # default: 19, covers labels 0..18
         return (
             torch.nn.functional.one_hot(
                 label_map.long().squeeze(0),
-                num_classes=self.N_CLASSES + 1  # 19: covers labels 0..18
+                num_classes=num_classes
             )
             .permute(3, 0, 1, 2)
             .float()
@@ -511,6 +572,7 @@ class SharedSynth(torch.nn.Module):
             label 3  → class 3 (Deep Gray Matter)
             label 4  → class 4 (CSF)
             label 18 → class 5 (WM-GM Separator)
+            label 21 → class 6 (FCD Lesion)  [native_synthesis path only]
             all else → class 0 (Background)
         """
         max_value = int(label_map.max().item()) + 1
@@ -521,12 +583,19 @@ class SharedSynth(torch.nn.Module):
                 if value < max_value:
                     lut[value] = class_index
 
+        if self.native_synthesis and 21 < max_value:
+            lut[21] = 6  # FCD lesion remapped from fusedmask label 21
         nb_classes = len(self.target_labels) + 1  # 6: background + 5 tissues
+        if self.native_synthesis:
+            nb_classes += 1  # +1 to accommodate class 6 (FCD lesion)
+
         return torch.clamp(lut[label_map.long()], 0, nb_classes - 1)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Model  —  6-class grouped segmentation (brain structures + FCD lesion)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class Model(pl.LightningModule):
     # ── Class-level label definitions — single source of truth ───────────────
@@ -552,33 +621,39 @@ class Model(pl.LightningModule):
             optimizer: str = 'Adam',
             optimizer_options: Optional[dict] = None,
             time_limit_minutes: float = None,
-            modality: str = 'random',
+            flair_modality: bool = False,
             flair_stats_csv: Optional[str] = FLAIR_STATS_CSV,
             n_best_batches: int = 2,
+            native_synthesis: bool = False,
+            lesion_gmm_params: Optional[dict] = None,  # GMM (μ, σ) for label 21 — native path only
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.optimizer_name    = optimizer
-        self.optimizer_options = dict(optimizer_options or {'lr': 1e-4})
-        self.time_limit_minutes = time_limit_minutes
-        self.alpha             = alpha
-        self.flair_stats_csv   = flair_stats_csv
-        self.target_labels     = self.TARGET_LABELS
+        # ── Native Approach ───────────────────────────────────────────────────────
+        self.native_synthesis  = native_synthesis
+        self.lesion_gmm_params = lesion_gmm_params or {'mu': (100, 180), 'sigma': (5, 20)}
+
+        self.optimizer_name       = optimizer
+        self.optimizer_options    = dict(optimizer_options or {'lr': 1e-4})
+        self.time_limit_minutes   = time_limit_minutes
+        self.alpha                = alpha
+        self.flair_stats_csv      = flair_stats_csv
+        self.target_labels        = self.TARGET_LABELS
 
         # ── Sub-modules ───────────────────────────────────────────────────────
-        self.subject_params_cache = self._load_subject_params()
-        seg_net       = self._build_seg_network(ndim, nb_classes, seg_features,seg_activation, seg_nb_levels, seg_nb_conv, seg_norm)
-        synth         = self._build_synth(modality)
-        loss_fn       = self._build_loss(loss)
-        self.network  = SynthSeg(seg_net, synth, loss_fn)
-        self.intensity_aug = self._build_intensity_aug()
-        self.fcd_aug  = FCDAugmentations()  # stateless utility — instantiated once
+        self.subject_params_cache   = self._load_subject_params()
+        seg_net                     = self._build_seg_network(ndim, nb_classes, seg_features,seg_activation, seg_nb_levels, seg_nb_conv, seg_norm)
+        synth                       = self._build_synth(flair_modality)
+        loss_fn                     = self._build_loss(loss)
+        self.network                = SynthSeg(seg_net, synth, loss_fn)
+        self.intensity_aug          = self._build_intensity_aug()
+        self.fcd_aug                = FCDAugmentations()
 
         # ── Metrics ───────────────────────────────────────────────────────────
-        _m = dict(include_background=False, num_classes=nb_classes, input_format='index')
-        self.val_dice     = dice_compute(average='micro', **_m)
-        self.val_dice_fcd = dice_compute(average='none',  **_m)
+        _m                  = dict(include_background=False, num_classes=nb_classes, input_format='index')
+        self.val_dice       = dice_compute(average='micro', **_m)
+        self.val_dice_fcd   = dice_compute(average='none',  **_m)
 
         # ── Manual optimisation ───────────────────────────────────────────────
         self.automatic_optimization = False
@@ -608,23 +683,30 @@ class Model(pl.LightningModule):
         print(f"  seg_nb_conv     : {self.hparams.seg_nb_conv}")
         print(f"  seg_norm        : {self.hparams.seg_norm}")
         print(f"  nb_classes      : {self.hparams.nb_classes}")
-        print(f"  modality        : '{self.hparams.modality}'")
+        modality = "Flair" if self.hparams.flair_modality else "Random Modality"
+        print(f"  modality        : {modality}")
+
         total_params = sum(p.numel() for p in seg.parameters())
         trainable = sum(p.numel() for p in seg.parameters() if p.requires_grad)
         print(f"  Total params    : {total_params:,}")
         print(f"  Trainable params: {trainable:,}")
 
         # ── Synthesis Pipeline ────────────────────────────────────────────────
-        print("\nDEBUG: Synthesis Pipeline")
+        approach = "Native SynthSeg Approach" if self.hparams.native_synthesis else "SynthFCD Approach"
+        print(f"\nDEBUG: Synthesis Pipeline  [{approach}]")
         print("─" * 60)
         print(f"  SharedSynth.synth type : {type(self.network.synth.synth).__name__}")
         gmm = getattr(self.network.synth.synth, 'gmm', None)
         print(f"  GMM type               : {type(gmm).__name__ if gmm else 'None'}")
         print(f"  GMM class_params keys  : {sorted(gmm.class_params.keys()) if gmm and hasattr(gmm, 'class_params') else 'N/A'}")
         print(f"  IntensityAug type      : {type(self.intensity_aug).__name__}")
-        print(f"  FCDAugmentations       : {type(self.fcd_aug).__name__}")
         print(f"  Subject params cached  : {len(self.subject_params_cache)} subjects")
 
+        if self.hparams.native_synthesis:
+            print(f"  Lesion GMM (class 21)  : {self.lesion_gmm_params}  [injected per-step]")
+            print(f"  FCDAugmentations       : disabled  [native path — GMM handles lesion appearance]")
+        else:
+            print(f"  FCDAugmentations       : {type(self.fcd_aug).__name__}")
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Private builders  (called only from __init__)
@@ -665,8 +747,8 @@ class Model(pl.LightningModule):
                         nb_levels=nb_levels, nb_conv=nb_conv, norm=norm)
         return SegNet(ndim, 1, nb_classes, backbone=backbone, activation=None)
 
-    def _build_synth(self, modality: str) -> SharedSynth:
-        if modality == 'flair':
+    def _build_synth(self, flair_modality: bool) -> SharedSynth:
+        if flair_modality:
             raw = CustomSynthFromLabelTransform(
                 num_ch=1, class_params=FLAIR_CLASS_PARAMS, use_per_class_gmm=True,
                 gmm_fwhm=10, bias=7, gamma=0.5, motion_fwhm=2.0, resolution=3,
@@ -682,7 +764,7 @@ class Model(pl.LightningModule):
             )
             raw.intensity = IdentityTransform()
 
-        return SharedSynth(raw, target_labels=self.target_labels)
+        return SharedSynth(raw, target_labels=self.target_labels, native_synthesis=self.native_synthesis)
 
     def _build_loss(self, loss: str):
         options = {
@@ -708,14 +790,17 @@ class Model(pl.LightningModule):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _set_subject_params(self, subject_id: Optional[str]):
-        """Swap GMM class_params for the current subject (falls back to global)."""
         params = (
             self.subject_params_cache[subject_id]
             if subject_id and subject_id in self.subject_params_cache
             else FLAIR_CLASS_PARAMS
         )
-        if self.hparams.modality == 'flair':
+        if self.hparams.flair_modality:
+            if self.hparams.native_synthesis:
+                params = dict(params)  # shallow copy — don't mutate the cache
+                params[21] = self.lesion_gmm_params
             self.network.synth.set_class_params(params)
+
     # ══════════════════════════════════════════════════════════════════════════
     #  Augmentation pipeline
     # ══════════════════════════════════════════════════════════════════════════
@@ -763,8 +848,9 @@ class Model(pl.LightningModule):
 
     def _process_single_sample(self, batch: dict, i: int):
         """
-        Full single-sample synthesis pipeline:
-          SharedSynth → FCD aug → IntensityTransform → label fusion.
+        Full single-sample synthesis pipeline.
+        native_synthesis=False : SharedSynth → FCD aug → IntensityTransform → label fusion
+        native_synthesis=True  : SharedSynth (fusedmask) → IntensityTransform  (no aug, no fusion)
         Returns (aug_image, aug_mask, real_image, real_mask) or None if skipped.
         """
         label_t    = batch['label_t'][i]
@@ -773,6 +859,39 @@ class Model(pl.LightningModule):
         aug_type   = batch['aug_type'][i]
         subject_id = batch.get('subject_id', [None] * len(batch['label_t']))[i]
 
+        # Validate the actual synthesis input — fusedmask on native path, labelmap otherwise
+        input_t = batch['fusedmask_t'][i] if self.hparams.native_synthesis else label_t
+        if input_t.sum() == 0 or torch.isnan(input_t.float()).any():
+            return None
+
+        self._set_subject_params(subject_id)
+
+        # ── Native synthesis path ─────────────────────────────────────────────────
+        if self.hparams.native_synthesis:
+            fusedmask_t = input_t  # already extracted above
+
+            # fusedmask acts as both slab (GMM input) and lab (real branch label target)
+            # roi omitted — lesion is already encoded as label 21 in fusedmask
+            simg, slab_out, rimg, rlab_out, _ = self.network.synth(
+                fusedmask_t, flair_t, fusedmask_t
+            )
+            simg_3d = simg.squeeze(0).float()
+
+            if self.hparams.flair_modality:
+                simg_3d = torch.clamp(simg_3d / 255.0, 0.0, 1.0)
+
+            aug_out = self.intensity_aug(simg_3d.unsqueeze(0))
+            aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
+
+            # slab_out and rlab_out already have class 6 from remap_labels — no label fusion needed
+            return (
+                aug_image_item,
+                slab_out.long(),
+                rimg.float(),
+                rlab_out.long(),
+            )
+
+        # ── Augmented synthesis path (original) ───────────────────────────────────
         aug_params = {
             'int_rng':     (batch['int_factor_min'][i].item(),  batch['int_factor_max'][i].item()),
             'blur_sigma':  (batch['blur_sigma_min'][i].item(),  batch['blur_sigma_max'][i].item()),
@@ -780,34 +899,22 @@ class Model(pl.LightningModule):
             'hyper_sigma': (batch['hyper_sigma_min'][i].item(), batch['hyper_sigma_max'][i].item()),
             'trans_sigma': (batch['trans_sigma_min'][i].item(), batch['trans_sigma_max'][i].item()),
         }
-
-        if label_t.sum() == 0 or torch.isnan(label_t.float()).any():
-            return None
-
-        self._set_subject_params(subject_id)
-
-        # Step 1: SharedSynth — geometry + GMM, no intensity transform
         simg, slab, rimg, rlab, rroi = self.network.synth(label_t, flair_t, label_t, roi_t)
         simg_3d = simg.squeeze(0).float()
         slab_3d = slab.squeeze(0).long()
         rroi_3d = (rroi.squeeze(0) > 0).long()
 
-        # FLAIR synthetic images are in [0, 255] range, but FCD augmentations expect [0, 1]
-        if self.hparams.modality == 'flair':
+        if self.hparams.flair_modality:
             simg_3d = torch.clamp(simg_3d / 255.0, 0.0, 1.0)
 
-        # Step 2: FCD appearance augmentations (synthetic branch only)
         choices = self._parse_aug_choices(aug_type)
         aug_img, rroi_3d = self._apply_fcd_augmentations(simg_3d.clone(), rroi_3d, choices, aug_params)
 
-        # Step 3: Debug NIfTI save — fires once per aug_type
         self._maybe_save_aug_sample(aug_img, rroi_3d, aug_type)
 
-        # Step 4: Standalone IntensityTransform (bias field, gamma, noise, resolution)
-        aug_out        = self.intensity_aug(aug_img.float().unsqueeze(0))
+        aug_out = self.intensity_aug(aug_img.float().unsqueeze(0))
         aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
 
-        # Step 5: Fuse FCD lesion (ROI → class 6) into both label maps
         slab_with_fcd = slab_3d.clone()
         slab_with_fcd[rroi_3d > 0] = 6
 
@@ -815,10 +922,10 @@ class Model(pl.LightningModule):
         rlab_with_fcd[rroi_3d > 0] = 6
 
         return (
-            aug_image_item,              # (1, D, H, W)  synthetic FLAIR — normalized [0,1]
-            slab_with_fcd.unsqueeze(0),  # (1, D, H, W)  synthetic target {0–6}
-            rimg.float(),                # (1, D, H, W)  real FLAIR — raw scale [~0, 245]
-            rlab_with_fcd.unsqueeze(0),  # (1, D, H, W)  real target {0–6}
+            aug_image_item,
+            slab_with_fcd.unsqueeze(0),
+            rimg.float(),
+            rlab_with_fcd.unsqueeze(0),
         )
 
     def synthesize_batch(self, batch: dict):
@@ -995,6 +1102,8 @@ class Model(pl.LightningModule):
         return self.network.segnet(x)
 
 
+
+
 # ── Helper Functions ──────────────────────────────────────────────────────────
 
 def save(dat, fname):
@@ -1160,7 +1269,6 @@ class LossGraphCallback(Callback):
 
             fig, ax1 = plt.subplots(figsize=(11, 6))
 
-            # Loss axis
             if "train_loss" in epoch_metrics:
                 ax1.plot(
                     epoch_metrics.index,
@@ -1187,7 +1295,6 @@ class LossGraphCallback(Callback):
             ax1.set_ylim(bottom=0)
             ax1.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.6)
 
-            # Dice axis
             ax2 = ax1.twinx()
 
             if "val_dice" in epoch_metrics:
@@ -1347,6 +1454,8 @@ class CLI(LightningCLI):
             "checkpoint.filename": "checkpoint-{epoch:02d}-{eval_loss:.2f}-{val_dice:.2f}",
             "checkpoint.every_n_epochs": 1,
         })
+        parser.link_arguments("model.native_synthesis", "data.native_synthesis")  # ← add
+
 
     def instantiate_trainer(self, **kwargs):
         run_name = os.environ.get(
