@@ -296,10 +296,12 @@ class SynthFromLabelTransform(torch.nn.Module):
         else:
             self.gmm = RandomGaussianMixtureTransform(fwhm=gmm_fwhm, background=0)
 
-        # ── Post-GMM intensity augmentation ───────────────────────────────────
-        self.intensity = do_nothing if no_augs else cc.IntensityTransform(
-            bias, gamma, motion_fwhm, resolution, snr, gfactor, order,
-        )
+            # ── Post-GMM intensity augmentation ───────────────────────────────────
+            # no_augs disables intensity only — deformation is always active
+            self.no_intensity = no_augs
+            self.intensity = do_nothing if no_augs else cc.IntensityTransform(
+                bias, gamma, motion_fwhm, resolution, snr, gfactor, order,
+            )
 
     def forward(self, x: torch.Tensor, coreg=None):
         """
@@ -320,18 +322,29 @@ class SynthFromLabelTransform(torch.nn.Module):
         # ── Stage 1: Geometric deformation ───────────────────────────────────
         # Stack x + coreg into one tensor so a single deform call applies the
         # same random field to everything simultaneously, then split back out.
-        if not self.no_augs:
-            if coreg is not None:
-                coreg_list = coreg if isinstance(coreg, (list, tuple)) else [coreg]
-                n_lab      = x.shape[0]
-                stacked    = torch.cat([x] + coreg_list, dim=0)
-                stacked    = self.deform(stacked)
-                x          = stacked[:n_lab]
-                coreg      = [stacked[n_lab + i] for i in range(len(coreg_list))]
-                if not isinstance(coreg, (list, tuple)):
-                    coreg = coreg[0]
-            else:
-                x = self.deform(x)
+        # if not self.no_augs:
+        #     if coreg is not None:
+        #         coreg_list = coreg if isinstance(coreg, (list, tuple)) else [coreg]
+        #         n_lab      = x.shape[0]
+        #         stacked    = torch.cat([x] + coreg_list, dim=0)
+        #         stacked    = self.deform(stacked)
+        #         x          = stacked[:n_lab]
+        #         coreg      = [stacked[n_lab + i] for i in range(len(coreg_list))]
+        #         if not isinstance(coreg, (list, tuple)):
+        #             coreg = coreg[0]
+        #     else:
+        #         x = self.deform(x)
+        if coreg is not None:
+            coreg_list = coreg if isinstance(coreg, (list, tuple)) else [coreg]
+            n_lab      = x.shape[0]
+            stacked    = torch.cat([x] + coreg_list, dim=0)
+            stacked    = self.deform(stacked)
+            x          = stacked[:n_lab]
+            coreg      = [stacked[n_lab + i] for i in range(len(coreg_list))]
+            if not isinstance(coreg, (list, tuple)):
+                coreg = coreg[0]
+        else:
+            x = self.deform(x)
 
         # ── Stage 2: GMM synthesis ────────────────────────────────────────────
         if self.gmm is not None:
