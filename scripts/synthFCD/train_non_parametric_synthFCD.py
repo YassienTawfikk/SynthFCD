@@ -124,7 +124,7 @@ class FCDDataset(Dataset):
         # Normalise fused_paths — None list when not native_synthesis
         if not fused_paths:
             fused_paths = [None] * len(label_paths)
-        
+
         for label_path, flair_path, roi_path, fused_path in zip(label_paths, flair_paths, roi_paths, fused_paths):
             subject_num = self._calc.get_subj_num(os.path.dirname(label_path))
             aug_matches = []
@@ -590,13 +590,210 @@ class SharedSynth(torch.nn.Module):
             nb_classes += 1  # +1 to accommodate class 6 (FCD lesion)
 
         return torch.clamp(lut[label_map.long()], 0, nb_classes - 1)
+# ══════════════════════════════════════════════════════════════════════════════
+#  SynthesisPipelineDebugger
+# ──────────────────────────────────────────────────────────────────────────────
+#  Saves intermediate NIfTI volumes at every stage of the synthesis pipeline
+#  for a user-specified set of subject IDs.  All other subjects are untouched.
+#
+#  Usage
+#  ─────
+#  Pass a set of subject IDs (as they appear in `subject_id` batch keys,
+#  e.g. "sub-00001") to Model via debug_subject_ids.  A unique save fires
+#  once per subject per training run (not once per epoch) to avoid disk bloat.
+#  To re-trigger saves (e.g. to see a later epoch), delete the saved folder.
+#
+#  Output layout
+#  ─────────────
+#  <OUTPUT_FOLDER>/pipeline_debug/<subject_id>/
+#      stage0_input_labelmap.nii.gz      — raw label map from disk (int)
+#      stage0_input_flair.nii.gz         — raw real FLAIR from disk (float)
+#      stage0_input_roi.nii.gz           — raw binary ROI from disk (int)
+#      stage0_input_fusedmask.nii.gz     — fusedmask (native path only, int)
+#      stage1_after_synth_simg.nii.gz    — synthetic image from GMM (float, pre-clamp)
+#      stage1_after_synth_slab.nii.gz    — deformed+remapped label map (int)
+#      stage1_after_synth_rimg.nii.gz    — deformed real FLAIR (float)
+#      stage1_after_synth_rlab.nii.gz    — deformed+remapped real label (int)
+#      stage1_after_synth_rroi.nii.gz    — deformed ROI (int, non-native only)
+#      stage2_after_clamp.nii.gz         — simg after /255 clamp to [0,1] (flair path only)
+#      stage3_after_fcd_aug.nii.gz       — after FCDAugmentations (non-native only)
+#      stage3_after_fcd_aug_roi.nii.gz   — ROI after thickening aug (non-native only)
+#      stage4_after_intensity.nii.gz     — final aug_image_item after IntensityTransform
+#      stage5_label_fused_slab.nii.gz    — slab after label fusion (class 6 stamped, non-native)
+#      stage5_label_fused_rlab.nii.gz    — rlab after label fusion (class 6 stamped, non-native)
+#      summary.txt                        — per-stage tensor stats (min/max/mean/shape)
+# ══════════════════════════════════════════════════════════════════════════════
 
+class SynthesisPipelineDebugger:
+    """
+    Saves intermediate volumes at every synthesis stage for selected subjects.
 
+    Parameters
+    ----------
+    debug_subject_ids : set[str]
+        Subject IDs (e.g. {"sub-00001", "sub-00027"}) for which to save debug
+        volumes.  Pass an empty set to disable entirely.
+    output_root : str
+        Root directory for debug output.  A sub-folder per subject is created.
+    save_once_per_subject : bool
+        If True (default), each subject is only saved on the first encounter
+        during the run.  Set to False to overwrite on every step (verbose).
+    """
+
+    def __init__(
+        self,
+        debug_subject_ids: set,
+        output_root: str,
+        save_once_per_subject: bool = True,
+    ):
+        self.debug_subject_ids = set(debug_subject_ids)
+        self.output_root = output_root
+        self.save_once = save_once_per_subject
+        self._saved: set = set()  # tracks which subjects have already been saved
+        self._aug_type_cache: dict = {}
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def is_debug_subject(self, subject_id: str, aug_type: str = "") -> bool:
+        if subject_id not in self.debug_subject_ids:
+            return False
+        if self.save_once and subject_id in self._saved:
+            return False
+        self._aug_type_cache[subject_id] = aug_type
+        return True
+
+    def save_stage0_inputs(
+        self,
+        subject_id: str,
+        label_t: torch.Tensor,
+        flair_t: torch.Tensor,
+        roi_t: torch.Tensor,
+        fusedmask_t: Optional[torch.Tensor] = None,
+    ):
+        """Stage 0 — raw tensors loaded from disk, before any processing."""
+        out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
+        self._save_nii(label_t.squeeze(),  out_dir, "stage0_input_labelmap.nii.gz",  dtype=np.int16)
+        self._save_nii(flair_t.squeeze(),  out_dir, "stage0_input_flair.nii.gz",     dtype=np.float32)
+        self._save_nii(roi_t.squeeze(),    out_dir, "stage0_input_roi.nii.gz",        dtype=np.uint8)
+        if fusedmask_t is not None:
+            self._save_nii(fusedmask_t.squeeze(), out_dir, "stage0_input_fusedmask.nii.gz", dtype=np.int16)
+        self._log_stats(subject_id, "stage0_input_labelmap",  label_t)
+        self._log_stats(subject_id, "stage0_input_flair",     flair_t)
+        self._log_stats(subject_id, "stage0_input_roi",       roi_t)
+        if fusedmask_t is not None:
+            self._log_stats(subject_id, "stage0_input_fusedmask", fusedmask_t)
+        print(f"[PipelineDebug] {subject_id} | Stage 0 saved → {out_dir}")
+
+    def save_stage1_after_synth(
+        self,
+        subject_id: str,
+        simg: torch.Tensor,
+        slab_out: torch.Tensor,
+        rimg: torch.Tensor,
+        rlab_out: torch.Tensor,
+        rroi: Optional[torch.Tensor] = None,
+    ):
+        """Stage 1 — output of SharedSynth: deformed + GMM-sampled synthetic image."""
+        out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
+        self._save_nii(simg.squeeze(),    out_dir, "stage1_after_synth_simg.nii.gz",  dtype=np.float32)
+        self._save_nii(slab_out.squeeze(),out_dir, "stage1_after_synth_slab.nii.gz",  dtype=np.int16)
+        self._save_nii(rimg.squeeze(),    out_dir, "stage1_after_synth_rimg.nii.gz",  dtype=np.float32)
+        self._save_nii(rlab_out.squeeze(),out_dir, "stage1_after_synth_rlab.nii.gz",  dtype=np.int16)
+        if rroi is not None:
+            self._save_nii(rroi.squeeze(), out_dir, "stage1_after_synth_rroi.nii.gz", dtype=np.uint8)
+        self._log_stats(subject_id, "stage1_simg",    simg)
+        self._log_stats(subject_id, "stage1_slab_out",slab_out)
+        self._log_stats(subject_id, "stage1_rimg",    rimg)
+        self._log_stats(subject_id, "stage1_rlab_out",rlab_out)
+        print(f"[PipelineDebug] {subject_id} | Stage 1 saved → {out_dir}")
+
+    def save_stage2_after_clamp(self, subject_id: str, simg_clamped: torch.Tensor):
+        """Stage 2 — after /255 clamp to [0,1] on flair path (skipped on non-flair path)."""
+        out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
+        self._save_nii(simg_clamped.squeeze(), out_dir, "stage2_after_clamp.nii.gz", dtype=np.float32)
+        self._log_stats(subject_id, "stage2_after_clamp", simg_clamped)
+        print(f"[PipelineDebug] {subject_id} | Stage 2 (clamp) saved → {out_dir}")
+
+    def save_stage3_after_fcd_aug(
+        self,
+        subject_id: str,
+        aug_img: torch.Tensor,
+        rroi_3d: torch.Tensor,
+        choices: list,
+    ):
+        """Stage 3 — after FCDAugmentations (SynthFCD path only)."""
+        out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
+        self._save_nii(aug_img.squeeze(),  out_dir, "stage3_after_fcd_aug.nii.gz",     dtype=np.float32)
+        self._save_nii(rroi_3d.squeeze(),  out_dir, "stage3_after_fcd_aug_roi.nii.gz", dtype=np.uint8)
+        self._log_stats(subject_id, f"stage3_after_fcd_aug (choices={choices})", aug_img)
+        print(f"[PipelineDebug] {subject_id} | Stage 3 (FCD aug: {choices}) saved → {out_dir}")
+
+    def save_stage4_after_intensity(self, subject_id: str, aug_image_item: torch.Tensor):
+        """Stage 4 — final aug_image_item after IntensityTransform, normalized to [0,1]."""
+        out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
+        self._save_nii(aug_image_item.squeeze(), out_dir, "stage4_after_intensity.nii.gz", dtype=np.float32)
+        self._log_stats(subject_id, "stage4_after_intensity", aug_image_item)
+        print(f"[PipelineDebug] {subject_id} | Stage 4 (intensity aug) saved → {out_dir}")
+
+    def save_stage5_label_fusion(
+        self,
+        subject_id: str,
+        slab_with_fcd: torch.Tensor,
+        rlab_with_fcd: torch.Tensor,
+    ):
+        """Stage 5 — after label fusion: ROI voxels stamped as class 6 (SynthFCD path only)."""
+        out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
+        self._save_nii(slab_with_fcd.squeeze(), out_dir, "stage5_label_fused_slab.nii.gz", dtype=np.int16)
+        self._save_nii(rlab_with_fcd.squeeze(), out_dir, "stage5_label_fused_rlab.nii.gz", dtype=np.int16)
+        self._log_stats(subject_id, "stage5_slab_with_fcd", slab_with_fcd)
+        self._log_stats(subject_id, "stage5_rlab_with_fcd", rlab_with_fcd)
+        print(f"[PipelineDebug] {subject_id} | Stage 5 (label fusion) saved → {out_dir}")
+
+    def mark_saved(self, subject_id: str):
+        """Call after all stages are saved to prevent re-saving this subject."""
+        self._saved.add(subject_id)
+        summary_path = os.path.join(self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, "")), "summary.txt")
+        try:
+            with open(summary_path, 'a') as f:
+                f.write(f"\n[PipelineDebug] All stages saved for {subject_id}.\n")
+        except Exception:
+            pass
+
+    # ── Internals ─────────────────────────────────────────────────────────────
+
+    def _subject_dir(self, subject_id: str, aug_type: str = "") -> str:
+        folder = f"{subject_id}-{aug_type.replace('+', '-')}" if aug_type else subject_id
+        d = os.path.join(self.output_root, folder)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _save_nii(self, tensor: torch.Tensor, out_dir: str, fname: str, dtype):
+        try:
+            arr = tensor.detach().cpu().numpy().astype(dtype)
+            nib.save(nib.Nifti1Image(arr, np.eye(4)), os.path.join(out_dir, fname))
+        except Exception as e:
+            print(f"[PipelineDebug] WARNING: could not save {fname}: {e}")
+
+    def _log_stats(self, subject_id: str, stage_name: str, tensor: torch.Tensor):
+        try:
+            t = tensor.detach().cpu().float()
+            line = (
+                f"[{stage_name}] "
+                f"shape={tuple(t.shape)}  "
+                f"dtype={tensor.dtype}  "
+                f"min={t.min().item():.4f}  "
+                f"max={t.max().item():.4f}  "
+                f"mean={t.mean().item():.4f}  "
+                f"unique_vals={len(torch.unique(t))}\n"
+            )
+            summary_path = os.path.join(self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, "")), "summary.txt")
+            with open(summary_path, 'a') as f:
+                f.write(line)
+        except Exception as e:
+            print(f"[PipelineDebug] WARNING: could not log stats for {stage_name}: {e}")
 # ══════════════════════════════════════════════════════════════════════════════
 #  Model  —  6-class grouped segmentation (brain structures + FCD lesion)
 # ══════════════════════════════════════════════════════════════════════════════
-
-
 class Model(pl.LightningModule):
     # ── Class-level label definitions — single source of truth ───────────────
     TARGET_LABELS = [
@@ -626,6 +823,7 @@ class Model(pl.LightningModule):
             n_best_batches: int = 2,
             native_synthesis: bool = False,
             lesion_gmm_params: Optional[dict] = None,  # GMM (μ, σ) for label 21 — native path only
+            debug_subject_ids: Optional[list] = None,  # subject IDs to save pipeline stages for
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -633,6 +831,19 @@ class Model(pl.LightningModule):
         # ── Native Approach ───────────────────────────────────────────────────────
         self.native_synthesis  = native_synthesis
         self.lesion_gmm_params = lesion_gmm_params or {'mu': (100, 180), 'sigma': (5, 20)}
+
+        # ── Pipeline debugger ─────────────────────────────────────────────────────
+        # Saves intermediate NIfTI volumes at every synthesis stage for the
+        # specified subjects.  Pass an empty list (or omit) to disable.
+        # Example CLI usage:
+        #   --model.debug_subject_ids '["sub-00001", "sub-00027", "sub-00065"]'
+        modality_tag = "flair" if flair_modality else "random"
+        synth_tag = "native" if native_synthesis else "synthFCD"
+        self._pipeline_debugger = SynthesisPipelineDebugger(
+            debug_subject_ids=set(debug_subject_ids or []),
+            output_root=os.path.join(OUTPUT_FOLDER, f"pipeline_debug_{modality_tag}_{synth_tag}"),
+            save_once_per_subject=True,
+        )
 
         self.optimizer_name       = optimizer
         self.optimizer_options    = dict(optimizer_options or {'lr': 1e-4})
@@ -662,7 +873,6 @@ class Model(pl.LightningModule):
         # ── State ─────────────────────────────────────────────────────────────
         self.n_best_batches    = n_best_batches
         self._val_batch_cache  = []
-        self._saved_aug_types  = set()
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Lifecycle hooks
@@ -707,6 +917,19 @@ class Model(pl.LightningModule):
             print(f"  FCDAugmentations       : disabled  [native path — GMM handles lesion appearance]")
         else:
             print(f"  FCDAugmentations       : {type(self.fcd_aug).__name__}")
+
+        # ── Pipeline Debugger ─────────────────────────────────────────────────
+        dbg = self._pipeline_debugger
+        if dbg.debug_subject_ids:
+            print(f"\nDEBUG: Pipeline Debugger ENABLED")
+            print(f"─" * 60)
+            print(f"  Subjects to debug      : {sorted(dbg.debug_subject_ids)}")
+            print(f"  Output root            : {dbg.output_root}")
+            print(f"  Save once per subject  : {dbg.save_once}")
+            print(f"  Stages saved           : 0=inputs, 1=synth, 2=clamp(flair), "
+                  f"3=fcd_aug(non-native), 4=intensity, 5=label_fusion(non-native)")
+        else:
+            print(f"\n  Pipeline Debugger      : DISABLED (no debug_subject_ids set)")
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Private builders  (called only from __init__)
@@ -830,29 +1053,18 @@ class Model(pl.LightningModule):
                     img, roi, sigma_range=params['blur_sigma'])
         return img, roi
 
-    def _maybe_save_aug_sample(self, aug_img: torch.Tensor, aug_mask: torch.Tensor,
-                               aug_type: str):
-        """Save one NIfTI sample per aug_type for debugging (fires once per type)."""
-        if aug_type in self._saved_aug_types:
-            return
-        self._saved_aug_types.add(aug_type)
-        save_dir = os.path.join(OUTPUT_FOLDER, 'saved_augs')
-        os.makedirs(save_dir, exist_ok=True)
-        nib.save(
-            nib.Nifti1Image(aug_img.detach().cpu().numpy(), np.eye(4)),
-            os.path.join(save_dir, f'subj_aug_{aug_type}_img.nii.gz'),
-        )
-        nib.save(
-            nib.Nifti1Image(aug_mask.detach().cpu().numpy().astype(np.uint8), np.eye(4)),
-            os.path.join(save_dir, f'subj_aug_{aug_type}_mask.nii.gz'),
-        )
-
     def _process_single_sample(self, batch: dict, i: int):
         """
         Full single-sample synthesis pipeline.
         native_synthesis=False : SharedSynth → FCD aug → IntensityTransform → label fusion
         native_synthesis=True  : SharedSynth (fusedmask) → IntensityTransform  (no aug, no fusion)
         Returns (aug_image, aug_mask, real_image, real_mask) or None if skipped.
+
+        Debug instrumentation
+        ─────────────────────
+        If subject_id appears in self._pipeline_debugger.debug_subject_ids, one NIfTI
+        volume is saved at every pipeline stage.  This fires once per subject per run
+        (controlled by SynthesisPipelineDebugger.save_once_per_subject).
         """
         label_t    = batch['label_t'][i]
         flair_t    = batch['flair_t'][i].float()
@@ -867,6 +1079,17 @@ class Model(pl.LightningModule):
 
         self._set_subject_params(subject_id)
 
+        # ── Debug: Stage 0 — raw inputs from disk ─────────────────────────────────
+        dbg = self._pipeline_debugger
+        is_debug = dbg.is_debug_subject(subject_id, aug_type)
+        if is_debug:
+            fusedmask_for_debug = (
+                batch['fusedmask_t'][i] if self.hparams.native_synthesis else None
+            )
+            dbg.save_stage0_inputs(
+                subject_id, label_t, flair_t, roi_t, fusedmask_for_debug
+            )
+
         # ── Native synthesis path ─────────────────────────────────────────────────
         if self.hparams.native_synthesis:
             fusedmask_t = input_t  # already extracted above
@@ -876,13 +1099,28 @@ class Model(pl.LightningModule):
             simg, slab_out, rimg, rlab_out, _ = self.network.synth(
                 fusedmask_t, flair_t, fusedmask_t
             )
+
+            # ── Debug: Stage 1 — after SharedSynth (deform + GMM) ─────────────────
+            if is_debug:
+                dbg.save_stage1_after_synth(
+                    subject_id, simg, slab_out, rimg, rlab_out, rroi=None
+                )
+
             simg_3d = simg.squeeze(0).float()
 
             if self.hparams.flair_modality:
                 simg_3d = torch.clamp(simg_3d / 255.0, 0.0, 1.0)
+                # ── Debug: Stage 2 — after /255 clamp ─────────────────────────────
+                if is_debug:
+                    dbg.save_stage2_after_clamp(subject_id, simg_3d)
 
             aug_out = self.intensity_aug(simg_3d.unsqueeze(0))
             aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
+
+            # ── Debug: Stage 4 — after IntensityTransform ─────────────────────────
+            if is_debug:
+                dbg.save_stage4_after_intensity(subject_id, aug_image_item)
+                dbg.mark_saved(subject_id)
 
             # slab_out and rlab_out already have class 6 from remap_labels — no label fusion needed
             return (
@@ -905,22 +1143,42 @@ class Model(pl.LightningModule):
         slab_3d = slab.squeeze(0).long()
         rroi_3d = (rroi.squeeze(0) > 0).long()
 
+        # ── Debug: Stage 1 — after SharedSynth (deform + GMM) ─────────────────────
+        if is_debug:
+            dbg.save_stage1_after_synth(subject_id, simg, slab, rimg, rlab, rroi)
+
         if self.hparams.flair_modality:
             simg_3d = torch.clamp(simg_3d / 255.0, 0.0, 1.0)
+            # ── Debug: Stage 2 — after /255 clamp ─────────────────────────────────
+            if is_debug:
+                dbg.save_stage2_after_clamp(subject_id, simg_3d)
 
         choices = self._parse_aug_choices(aug_type)
         aug_img, rroi_3d = self._apply_fcd_augmentations(simg_3d.clone(), rroi_3d, choices, aug_params)
 
-        self._maybe_save_aug_sample(aug_img, rroi_3d, aug_type)
+        # ── Debug: Stage 3 — after FCDAugmentations ───────────────────────────────
+        if is_debug:
+            dbg.save_stage3_after_fcd_aug(subject_id, aug_img, rroi_3d, choices)
 
         aug_out = self.intensity_aug(aug_img.float().unsqueeze(0))
         aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
+
+        # ── Debug: Stage 4 — after IntensityTransform ─────────────────────────────
+        if is_debug:
+            dbg.save_stage4_after_intensity(subject_id, aug_image_item)
 
         slab_with_fcd = slab_3d.clone()
         slab_with_fcd[rroi_3d > 0] = 6
 
         rlab_with_fcd = rlab.long().squeeze(0).clone()
         rlab_with_fcd[rroi_3d > 0] = 6
+
+        # ── Debug: Stage 5 — after label fusion ───────────────────────────────────
+        if is_debug:
+            dbg.save_stage5_label_fusion(
+                subject_id, slab_with_fcd.unsqueeze(0), rlab_with_fcd.unsqueeze(0)
+            )
+            dbg.mark_saved(subject_id)
 
         return (
             aug_image_item,
