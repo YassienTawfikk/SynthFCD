@@ -224,8 +224,9 @@ class SynthFromLabelTransform(torch.nn.Module):
 
         one-hot label map
             │
-            ▼  [1] Geometric deformation  (disabled when no_augs=True)
+            ▼  [1] Geometric deformation
             │      RandomAffineElasticTransform — same field applied to x and coreg
+            │      rlab and rroi rounded to nearest integer after deformation
             │
             ▼  [2] GMM synthesis
             │      PerClassGaussianMixtureTransform  (default, uses FLAIR_CLASS_PARAMS)
@@ -235,7 +236,6 @@ class SynthFromLabelTransform(torch.nn.Module):
                    cc.IntensityTransform — bias field, gamma, noise, resolution
 
     In the FCD training pipeline, ``no_augs=True`` is used so that:
-    - Geometric deformation is handled externally (or skipped).
     - Intensity augmentation is applied downstream after FCD augmentations.
 
     Parameters
@@ -243,10 +243,9 @@ class SynthFromLabelTransform(torch.nn.Module):
     num_ch : int
         Number of output image channels (default 1 — single FLAIR channel).
     no_augs : bool
-        Disable both geometric deformation and intensity augmentation.
+        Disable intensity augmentation only — deformation always runs.
     class_params : dict, optional
-        Per-class GMM params. Pass ``FLAIR_CLASS_PARAMS`` or a per-subject
-        variant. Falls back to the legacy single-range GMM when ``None``.
+        Per-class GMM params. Falls back to the legacy single-range GMM when None.
     use_per_class_gmm : bool
         When True and class_params is provided, use PerClassGaussianMixtureTransform.
     skip_gmm : bool
@@ -297,6 +296,7 @@ class SynthFromLabelTransform(torch.nn.Module):
             self.gmm = RandomGaussianMixtureTransform(fwhm=gmm_fwhm, background=0)
 
         # ── Post-GMM intensity augmentation ───────────────────────────────────
+        # no_augs disables intensity only — deformation is always active
         self.intensity = do_nothing if no_augs else cc.IntensityTransform(
             bias, gamma, motion_fwhm, resolution, snr, gfactor, order,
         )
@@ -309,7 +309,10 @@ class SynthFromLabelTransform(torch.nn.Module):
             One-hot label map. n_classes = N_CLASSES + 1 = 19 for labels 0–18.
         coreg : Tensor or list[Tensor], optional
             Extra volumes co-deformed with x (e.g. real FLAIR, label map, ROI).
-            Same random deformation field is applied to all co-registered volumes.
+            coreg order: [rimg, rlab, rroi]
+            - rimg : float image — cubic interpolation
+            - rlab : integer label map — nearest-neighbour interpolation
+            - rroi : binary mask — nearest-neighbour interpolation
 
         Returns
         -------
@@ -318,20 +321,33 @@ class SynthFromLabelTransform(torch.nn.Module):
         coreg : Tensor or list[Tensor]        — only when coreg was provided
         """
         # ── Stage 1: Geometric deformation ───────────────────────────────────
-        # Stack x + coreg into one tensor so a single deform call applies the
-        # same random field to everything simultaneously, then split back out.
-        if not self.no_augs:
-            if coreg is not None:
-                coreg_list = coreg if isinstance(coreg, (list, tuple)) else [coreg]
-                n_lab      = x.shape[0]
-                stacked    = torch.cat([x] + coreg_list, dim=0)
-                stacked    = self.deform(stacked)
-                x          = stacked[:n_lab]
-                coreg      = [stacked[n_lab + i] for i in range(len(coreg_list))]
-                if not isinstance(coreg, (list, tuple)):
-                    coreg = coreg[0]
-            else:
-                x = self.deform(x)
+        # Freeze the random field relative to x's spatial shape.
+        # rimg is deformed with cubic interpolation (order=3).
+        # rlab and rroi are deformed with nearest-neighbour (nearest_if_label=True)
+        # using the same frozen field — no interpolation artifacts on label maps.
+        frozen_deform = self.deform.make_final(x)
+        if coreg is not None:
+            coreg_list = coreg if isinstance(coreg, (list, tuple)) else [coreg]
+            n_lab = x.shape[0]
+
+            # Deform everything together with cubic — preserves original shape behavior
+            stacked = torch.cat([x] + coreg_list, dim=0)
+            stacked = frozen_deform(stacked)
+            x = stacked[:n_lab]
+            coreg_out = [stacked[n_lab + i] for i in range(len(coreg_list))]
+
+            # Re-apply same frozen field to rlab (index 1) and rroi (index 2)
+            # with nearest-neighbour to fix cubic interpolation artifacts
+            frozen_deform.nearest_if_label = True
+            if len(coreg_out) > 1:
+                coreg_out[1] = frozen_deform(coreg_list[1].round().long())
+            if len(coreg_out) > 2:
+                coreg_out[2] = frozen_deform(coreg_list[2].round().long())
+            frozen_deform.nearest_if_label = False
+
+            coreg = coreg_out if isinstance(coreg, (list, tuple)) else coreg_out[0]
+        else:
+            x = frozen_deform(x)
 
         # ── Stage 2: GMM synthesis ────────────────────────────────────────────
         if self.gmm is not None:
