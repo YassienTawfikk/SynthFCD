@@ -310,9 +310,9 @@ class SynthFromLabelTransform(torch.nn.Module):
         coreg : Tensor or list[Tensor], optional
             Extra volumes co-deformed with x (e.g. real FLAIR, label map, ROI).
             coreg order: [rimg, rlab, rroi]
-            - rimg : float image — cubic interpolation, no rounding
-            - rlab : integer label map — rounded after cubic interpolation
-            - rroi : binary mask — thresholded at 0.5 after cubic interpolation
+            - rimg : float image — cubic interpolation
+            - rlab : integer label map — nearest-neighbour interpolation
+            - rroi : binary mask — nearest-neighbour interpolation
 
         Returns
         -------
@@ -321,30 +321,31 @@ class SynthFromLabelTransform(torch.nn.Module):
         coreg : Tensor or list[Tensor]        — only when coreg was provided
         """
         # ── Stage 1: Geometric deformation ───────────────────────────────────
-        # Freeze the random deformation field relative to x's spatial shape,
-        # then apply the same field to everything simultaneously via stacking.
-        # rlab and rroi are rounded/thresholded after deformation to remove
-        # cubic interpolation artifacts on integer-valued volumes.
+        # Freeze the random field relative to x's spatial shape.
+        # rimg is deformed with cubic interpolation (order=3).
+        # rlab and rroi are deformed with nearest-neighbour (nearest_if_label=True)
+        # using the same frozen field — no interpolation artifacts on label maps.
         frozen_deform = self.deform.make_final(x)
         if coreg is not None:
-            coreg_list = coreg if isinstance(coreg, (list, tuple)) else [coreg]
-            n_lab      = x.shape[0]
-            stacked    = torch.cat([x] + coreg_list, dim=0)
-            stacked    = frozen_deform(stacked)
-            x          = stacked[:n_lab]
-            coreg_out  = [stacked[n_lab + i] for i in range(len(coreg_list))]
+            coreg_list  = coreg if isinstance(coreg, (list, tuple)) else [coreg]
+            n_lab       = x.shape[0]
+            rimg_coreg  = coreg_list[:1]   # [rimg] — float image, cubic ok
+            label_coreg = coreg_list[1:]   # [rlab, rroi] — integer maps, nearest-neighbour
 
-            # Fix interpolation artifacts:
-            # coreg order is [rimg, rlab, rroi]
-            # rimg (index 0): float image — no correction needed
-            # rlab (index 1): integer label map — round to nearest integer
-            # rroi (index 2): binary mask — threshold at 0.5
-            if len(coreg_out) > 1:
-                coreg_out[1] = coreg_out[1].round()
-            if len(coreg_out) > 2:
-                coreg_out[2] = (coreg_out[2] > 0.5).to(coreg_out[2].dtype)
+            # Deform x (one-hot) + rimg together with cubic interpolation
+            stacked  = torch.cat([x] + rimg_coreg, dim=0)
+            stacked  = frozen_deform(stacked)
+            x        = stacked[:n_lab]
+            rimg_out = [stacked[n_lab + i] for i in range(len(rimg_coreg))]
 
-            coreg = coreg_out if isinstance(coreg, (list, tuple)) else coreg_out[0]
+            # Deform rlab and rroi with nearest-neighbour using the same frozen field
+            frozen_deform.nearest_if_label = True
+            label_out = [frozen_deform(v.round().long().float()) for v in label_coreg]
+            frozen_deform.nearest_if_label = False  # restore for safety
+
+            coreg = rimg_out + label_out
+            if not isinstance(coreg, (list, tuple)):
+                coreg = coreg[0]
         else:
             x = frozen_deform(x)
 
