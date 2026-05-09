@@ -340,7 +340,7 @@ class SynthFromLabelTransform(torch.nn.Module):
 
             # Deform rlab and rroi with nearest-neighbour using the same frozen field
             frozen_deform.nearest_if_label = True
-            label_out = [frozen_deform(v.round().long().float()) for v in label_coreg]
+            label_out = [frozen_deform(v.round().long()) for v in label_coreg]
             frozen_deform.nearest_if_label = False  # restore for safety
 
             coreg = rimg_out + label_out
