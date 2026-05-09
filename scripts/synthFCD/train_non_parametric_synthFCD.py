@@ -76,7 +76,6 @@ from learn2synth.configurations import (
 # ── FCDDataset ────────────────────────────────────────────────────────────────
 # Returns un-augmented volumes plus random augmentation configurations.
 # Actual GPU synthesis happens inside Model.synthesize_batch
-
 class FCDDataset(Dataset):
     def __init__(
             self,
@@ -225,7 +224,6 @@ class FCDDataset(Dataset):
 #    use_extra_data    (default False)          — set True to train on raw + extra
 #    val_from_raw_only (default False)          — set True to take validation from raw only
 # ──────────────────────────────────────────────────────────────────────────────
-
 class FCDDataModule(pl.LightningDataModule):
     def __init__(self,
                  ndim: int = 3,
@@ -425,7 +423,6 @@ class FCDDataModule(pl.LightningDataModule):
 # ══════════════════════════════════════════════════════════════════════════════
 #  SharedSynth  —  geometry + GMM forward pass, intensity kept separate
 # ══════════════════════════════════════════════════════════════════════════════
-
 class SharedSynth(torch.nn.Module):
     """
     GMM synthesis + label remapping for the FCD segmentation pipeline.
@@ -590,6 +587,8 @@ class SharedSynth(torch.nn.Module):
             nb_classes += 1  # +1 to accommodate class 6 (FCD lesion)
 
         return torch.clamp(lut[label_map.long()], 0, nb_classes - 1)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SynthesisPipelineDebugger
 # ──────────────────────────────────────────────────────────────────────────────
@@ -623,7 +622,6 @@ class SharedSynth(torch.nn.Module):
 #      stage5_label_fused_rlab.nii.gz    — rlab after label fusion (class 6 stamped, non-native)
 #      summary.txt                        — per-stage tensor stats (min/max/mean/shape)
 # ══════════════════════════════════════════════════════════════════════════════
-
 class SynthesisPipelineDebugger:
     """
     Saves intermediate volumes at every synthesis stage for selected subjects.
@@ -791,6 +789,8 @@ class SynthesisPipelineDebugger:
                 f.write(line)
         except Exception as e:
             print(f"[PipelineDebug] WARNING: could not log stats for {stage_name}: {e}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Model  —  6-class grouped segmentation (brain structures + FCD lesion)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1361,8 +1361,6 @@ class Model(pl.LightningModule):
         return self.network.segnet(x)
 
 
-
-
 # ── Helper Functions ──────────────────────────────────────────────────────────
 
 def save(dat, fname):
@@ -1370,6 +1368,8 @@ def save(dat, fname):
     h = nib.Nifti1Header()
     h.set_data_dtype(dat.dtype)
     nib.save(nib.Nifti1Image(dat, np.eye(4), h), fname)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  TimeLimitCallback
 # ──────────────────────────────────────────────────────────────────────────────
