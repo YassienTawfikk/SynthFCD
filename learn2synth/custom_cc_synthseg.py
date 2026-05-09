@@ -347,11 +347,22 @@ class SynthFromLabelTransform(torch.nn.Module):
         frozen_deform = self.deform.make_final(x)
         if coreg is not None:
             coreg_list = coreg if isinstance(coreg, (list, tuple)) else [coreg]
+            # x (one-hot) and first coreg (rimg) use cubic interpolation
+            # remaining coreg (rlab, rroi) are integer label maps — use nearest neighbour
+            rimg_coreg = coreg_list[:1]  # [rimg] — float image, cubic ok
+            label_coreg = coreg_list[1:]  # [rlab, rroi] — integer maps, need nearest
+
             n_lab = x.shape[0]
-            stacked = torch.cat([x] + coreg_list, dim=0)
+            stacked = torch.cat([x] + rimg_coreg, dim=0)
             stacked = frozen_deform(stacked)
             x = stacked[:n_lab]
-            coreg = [stacked[n_lab + i] for i in range(len(coreg_list))]
+            rimg_out = [stacked[n_lab + i] for i in range(len(rimg_coreg))]
+
+            # Deform label/roi volumes with nearest-neighbour interpolation
+            nn_deform = self.deform.make_final(x[:1], order=0)
+            label_out = [nn_deform(v) for v in label_coreg]
+
+            coreg = rimg_out + label_out
             if not isinstance(coreg, (list, tuple)):
                 coreg = coreg[0]
         else:
