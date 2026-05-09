@@ -76,7 +76,6 @@ from learn2synth.configurations import (
 # ── FCDDataset ────────────────────────────────────────────────────────────────
 # Returns un-augmented volumes plus random augmentation configurations.
 # Actual GPU synthesis happens inside Model.synthesize_batch
-
 class FCDDataset(Dataset):
     def __init__(
             self,
@@ -124,7 +123,7 @@ class FCDDataset(Dataset):
         # Normalise fused_paths — None list when not native_synthesis
         if not fused_paths:
             fused_paths = [None] * len(label_paths)
-
+        
         for label_path, flair_path, roi_path, fused_path in zip(label_paths, flair_paths, roi_paths, fused_paths):
             subject_num = self._calc.get_subj_num(os.path.dirname(label_path))
             aug_matches = []
@@ -225,7 +224,6 @@ class FCDDataset(Dataset):
 #    use_extra_data    (default False)          — set True to train on raw + extra
 #    val_from_raw_only (default False)          — set True to take validation from raw only
 # ──────────────────────────────────────────────────────────────────────────────
-
 class FCDDataModule(pl.LightningDataModule):
     def __init__(self,
                  ndim: int = 3,
@@ -425,7 +423,6 @@ class FCDDataModule(pl.LightningDataModule):
 # ══════════════════════════════════════════════════════════════════════════════
 #  SharedSynth  —  geometry + GMM forward pass, intensity kept separate
 # ══════════════════════════════════════════════════════════════════════════════
-
 class SharedSynth(torch.nn.Module):
     """
     GMM synthesis + label remapping for the FCD segmentation pipeline.
@@ -589,7 +586,8 @@ class SharedSynth(torch.nn.Module):
         if self.native_synthesis:
             nb_classes += 1  # +1 to accommodate class 6 (FCD lesion)
 
-        return torch.clamp(lut[label_map.long()], 0, nb_classes - 1)
+        return torch.clamp(lut[label_map.float().round().long()], 0, nb_classes - 1)
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SynthesisPipelineDebugger
 # ──────────────────────────────────────────────────────────────────────────────
@@ -791,6 +789,8 @@ class SynthesisPipelineDebugger:
                 f.write(line)
         except Exception as e:
             print(f"[PipelineDebug] WARNING: could not log stats for {stage_name}: {e}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Model  —  6-class grouped segmentation (brain structures + FCD lesion)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1071,7 +1071,7 @@ class Model(pl.LightningModule):
         roi_t      = batch['roi_t'][i]
         aug_type   = batch['aug_type'][i]
         subject_id = batch.get('subject_id', [None] * len(batch['label_t']))[i]
-
+        
         # Validate the actual synthesis input — fusedmask on native path, labelmap otherwise
         input_t = batch['fusedmask_t'][i] if self.hparams.native_synthesis else label_t
         if input_t.sum() == 0 or torch.isnan(input_t.float()).any():
@@ -1126,7 +1126,7 @@ class Model(pl.LightningModule):
             return (
                 aug_image_item,
                 slab_out.long(),
-                rimg.float(),
+                rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0),
                 rlab_out.long(),
             )
 
@@ -1138,6 +1138,7 @@ class Model(pl.LightningModule):
             'hyper_sigma': (batch['hyper_sigma_min'][i].item(), batch['hyper_sigma_max'][i].item()),
             'trans_sigma': (batch['trans_sigma_min'][i].item(), batch['trans_sigma_max'][i].item()),
         }
+
         simg, slab, rimg, rlab, rroi = self.network.synth(label_t, flair_t, label_t, roi_t)
         simg_3d = simg.squeeze(0).float()
         slab_3d = slab.squeeze(0).long()
@@ -1179,14 +1180,14 @@ class Model(pl.LightningModule):
                 subject_id, slab_with_fcd.unsqueeze(0), rlab_with_fcd.unsqueeze(0)
             )
             dbg.mark_saved(subject_id)
-
+    
         return (
             aug_image_item,
             slab_with_fcd.unsqueeze(0),
-            rimg.float(),
+            rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0),
             rlab_with_fcd.unsqueeze(0),
         )
-
+    
     def synthesize_batch(self, batch: dict):
         """Run the synthesis pipeline for every sample. Returns stacked tensors."""
         results     = []
@@ -1361,8 +1362,6 @@ class Model(pl.LightningModule):
         return self.network.segnet(x)
 
 
-
-
 # ── Helper Functions ──────────────────────────────────────────────────────────
 
 def save(dat, fname):
@@ -1370,6 +1369,8 @@ def save(dat, fname):
     h = nib.Nifti1Header()
     h.set_data_dtype(dat.dtype)
     nib.save(nib.Nifti1Image(dat, np.eye(4), h), fname)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  TimeLimitCallback
 # ──────────────────────────────────────────────────────────────────────────────
