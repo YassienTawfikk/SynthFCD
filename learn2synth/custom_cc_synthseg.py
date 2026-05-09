@@ -298,7 +298,6 @@ class SynthFromLabelTransform(torch.nn.Module):
 
             # ── Post-GMM intensity augmentation ───────────────────────────────────
             # no_augs disables intensity only — deformation is always active
-            self.no_intensity = no_augs
             self.intensity = do_nothing if no_augs else cc.IntensityTransform(
                 bias, gamma, motion_fwhm, resolution, snr, gfactor, order,
             )
