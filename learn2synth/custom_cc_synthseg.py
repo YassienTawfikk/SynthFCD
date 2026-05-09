@@ -333,17 +333,29 @@ class SynthFromLabelTransform(torch.nn.Module):
         #             coreg = coreg[0]
         #     else:
         #         x = self.deform(x)
+        # if coreg is not None:
+        #     coreg_list = coreg if isinstance(coreg, (list, tuple)) else [coreg]
+        #     n_lab      = x.shape[0]
+        #     stacked    = torch.cat([x] + coreg_list, dim=0)
+        #     stacked    = self.deform(stacked)
+        #     x          = stacked[:n_lab]
+        #     coreg      = [stacked[n_lab + i] for i in range(len(coreg_list))]
+        #     if not isinstance(coreg, (list, tuple)):
+        #         coreg = coreg[0]
+        # else:
+        #     x = self.deform(x)
+        frozen_deform = self.deform.make_final(x)
         if coreg is not None:
             coreg_list = coreg if isinstance(coreg, (list, tuple)) else [coreg]
-            n_lab      = x.shape[0]
-            stacked    = torch.cat([x] + coreg_list, dim=0)
-            stacked    = self.deform(stacked)
-            x          = stacked[:n_lab]
-            coreg      = [stacked[n_lab + i] for i in range(len(coreg_list))]
+            n_lab = x.shape[0]
+            stacked = torch.cat([x] + coreg_list, dim=0)
+            stacked = frozen_deform(stacked)
+            x = stacked[:n_lab]
+            coreg = [stacked[n_lab + i] for i in range(len(coreg_list))]
             if not isinstance(coreg, (list, tuple)):
                 coreg = coreg[0]
         else:
-            x = self.deform(x)
+            x = frozen_deform(x)
 
         # ── Stage 2: GMM synthesis ────────────────────────────────────────────
         if self.gmm is not None:
