@@ -327,25 +327,25 @@ class SynthFromLabelTransform(torch.nn.Module):
         # using the same frozen field — no interpolation artifacts on label maps.
         frozen_deform = self.deform.make_final(x)
         if coreg is not None:
-            coreg_list  = coreg if isinstance(coreg, (list, tuple)) else [coreg]
-            n_lab       = x.shape[0]
-            rimg_coreg  = coreg_list[:1]   # [rimg] — float image, cubic ok
-            label_coreg = coreg_list[1:]   # [rlab, rroi] — integer maps, nearest-neighbour
+            coreg_list = coreg if isinstance(coreg, (list, tuple)) else [coreg]
+            n_lab = x.shape[0]
 
-            # Deform x (one-hot) + rimg together with cubic interpolation
-            stacked  = torch.cat([x] + rimg_coreg, dim=0)
-            stacked  = frozen_deform(stacked)
-            x        = stacked[:n_lab]
-            rimg_out = [stacked[n_lab + i] for i in range(len(rimg_coreg))]
+            # Deform everything together with cubic — preserves original shape behavior
+            stacked = torch.cat([x] + coreg_list, dim=0)
+            stacked = frozen_deform(stacked)
+            x = stacked[:n_lab]
+            coreg_out = [stacked[n_lab + i] for i in range(len(coreg_list))]
 
-            # Deform rlab and rroi with nearest-neighbour using the same frozen field
+            # Re-apply same frozen field to rlab (index 1) and rroi (index 2)
+            # with nearest-neighbour to fix cubic interpolation artifacts
             frozen_deform.nearest_if_label = True
-            label_out = [frozen_deform(v.round().long()) for v in label_coreg]
-            frozen_deform.nearest_if_label = False  # restore for safety
+            if len(coreg_out) > 1:
+                coreg_out[1] = frozen_deform(coreg_list[1].round().long())
+            if len(coreg_out) > 2:
+                coreg_out[2] = frozen_deform(coreg_list[2].round().long())
+            frozen_deform.nearest_if_label = False
 
-            coreg = rimg_out + label_out
-            if not isinstance(coreg, (list, tuple)):
-                coreg = coreg[0]
+            coreg = coreg_out if isinstance(coreg, (list, tuple)) else coreg_out[0]
         else:
             x = frozen_deform(x)
 
