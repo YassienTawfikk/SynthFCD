@@ -11,8 +11,8 @@ from learn2synth.custom_cc_synthseg import load_class_params_from_csv
 # ── Dataset paths ─────────────────────────────────────────────────────────────
 DEFAULT_FOLDER = '/kaggle/input/datasets/yassientawfikkk/augmented-fcd-lesion-mri-dataset/fcd/'
 OUTPUT_FOLDER = '/kaggle/working'
-FLAIR_CLASS_PARAMS_CSV = '/kaggle/input/datasets/nancyabdelfattah/flair-stats-synthseg/flair_class_params_fcd_train.csv'
-FLAIR_STATS_CSV = '/kaggle/input/datasets/nancyabdelfattah/flair-stats-synthseg/flair_stats_raw_fcd_train.csv'
+FLAIR_CLASS_PARAMS_CSV = '/kaggle/working/flair-stats-synthseg/flair_class_params_fcd_train.csv'
+FLAIR_STATS_CSV = '/kaggle/working/flair-stats-synthseg/flair_stats_raw_fcd_train.csv'
 
 # ── Per-subject file names ────────────────────────────────────────────────────
 t1_file = 't1.nii'
