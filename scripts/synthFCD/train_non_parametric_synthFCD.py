@@ -123,7 +123,7 @@ class FCDDataset(Dataset):
         # Normalise fused_paths — None list when not native_synthesis
         if not fused_paths:
             fused_paths = [None] * len(label_paths)
-
+        
         for label_path, flair_path, roi_path, fused_path in zip(label_paths, flair_paths, roi_paths, fused_paths):
             subject_num = self._calc.get_subj_num(os.path.dirname(label_path))
             aug_matches = []
@@ -586,8 +586,7 @@ class SharedSynth(torch.nn.Module):
         if self.native_synthesis:
             nb_classes += 1  # +1 to accommodate class 6 (FCD lesion)
 
-        return torch.clamp(lut[label_map.long()], 0, nb_classes - 1)
-
+        return torch.clamp(lut[label_map.float().round().long()], 0, nb_classes - 1)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SynthesisPipelineDebugger
@@ -622,6 +621,7 @@ class SharedSynth(torch.nn.Module):
 #      stage5_label_fused_rlab.nii.gz    — rlab after label fusion (class 6 stamped, non-native)
 #      summary.txt                        — per-stage tensor stats (min/max/mean/shape)
 # ══════════════════════════════════════════════════════════════════════════════
+
 class SynthesisPipelineDebugger:
     """
     Saves intermediate volumes at every synthesis stage for selected subjects.
@@ -1071,7 +1071,7 @@ class Model(pl.LightningModule):
         roi_t      = batch['roi_t'][i]
         aug_type   = batch['aug_type'][i]
         subject_id = batch.get('subject_id', [None] * len(batch['label_t']))[i]
-
+        
         # Validate the actual synthesis input — fusedmask on native path, labelmap otherwise
         input_t = batch['fusedmask_t'][i] if self.hparams.native_synthesis else label_t
         if input_t.sum() == 0 or torch.isnan(input_t.float()).any():
@@ -1126,7 +1126,7 @@ class Model(pl.LightningModule):
             return (
                 aug_image_item,
                 slab_out.long(),
-                rimg.float(),
+                rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0),
                 rlab_out.long(),
             )
 
@@ -1138,6 +1138,7 @@ class Model(pl.LightningModule):
             'hyper_sigma': (batch['hyper_sigma_min'][i].item(), batch['hyper_sigma_max'][i].item()),
             'trans_sigma': (batch['trans_sigma_min'][i].item(), batch['trans_sigma_max'][i].item()),
         }
+
         simg, slab, rimg, rlab, rroi = self.network.synth(label_t, flair_t, label_t, roi_t)
         simg_3d = simg.squeeze(0).float()
         slab_3d = slab.squeeze(0).long()
@@ -1179,14 +1180,14 @@ class Model(pl.LightningModule):
                 subject_id, slab_with_fcd.unsqueeze(0), rlab_with_fcd.unsqueeze(0)
             )
             dbg.mark_saved(subject_id)
-
+    
         return (
             aug_image_item,
             slab_with_fcd.unsqueeze(0),
-            rimg.float(),
+            rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0),
             rlab_with_fcd.unsqueeze(0),
         )
-
+    
     def synthesize_batch(self, batch: dict):
         """Run the synthesis pipeline for every sample. Returns stacked tensors."""
         results     = []
