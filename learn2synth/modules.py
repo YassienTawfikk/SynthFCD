@@ -231,113 +231,169 @@ class CrossHairConv(SeparableConv):
 
 
 class ConvBlockBase(nn.Sequential):
-    """Base class for convolution blocks (i.e. Norm+Conv+Dropout+Activation),
-    with or without strides/transpose"""
+    """Base class for convolution blocks: Norm + Conv + Dropout + Activation."""
 
-    def __init__(self, ndim, in_channels, out_channels, opt_conv=None,
-                 activation='ReLU', norm=None, dropout=False, order='ncda',
-                 separable=False):
+    def __init__(
+            self,
+            ndim,
+            in_channels,
+            out_channels,
+            opt_conv=None,
+            activation="ReLU",
+            norm=None,
+            dropout=False,
+            order="ncda",
+            separable=False,
+    ):
         super().__init__()
+
         self.order = self.fix_order(order)
-        conv = self.make_conv(ndim, in_channels, out_channels,
-                              opt_conv or {}, separable)
+
+        conv = self.make_conv(
+            ndim,
+            in_channels,
+            out_channels,
+            opt_conv or {},
+            separable,
+        )
         norm = self.make_norm(norm, ndim, conv, self.order)
         dropout = self.make_dropout(dropout, ndim)
         activation = self.make_activation(activation)
 
-        # Assign submodules in order
-        for o in self.order:
-            if o == 'n':
+        for layer_type in self.order:
+            if layer_type == "n":
                 self.norm = norm
-            elif o == 'c':
+            elif layer_type == "c":
                 self.conv = conv
-            elif o == 'd':
+            elif layer_type == "d":
                 self.dropout = dropout
-            elif o == 'a':
+            elif layer_type == "a":
                 self.activation = activation
 
     @staticmethod
     def fix_order(order):
         order = order.lower()
-        if 'n' not in order:
-            order = order + 'n'
-        if 'c' not in order:
-            order = order + 'c'
-        if 'd' not in order:
-            order = order + 'd'
-        if 'a' not in order:
-            order = order + 'a'
+
+        for layer_type in "ncda":
+            if layer_type not in order:
+                order += layer_type
+
         return order
 
     @staticmethod
     def make_conv(ndim, in_channels, out_channels, opt_conv, separable):
-        transpose = opt_conv.pop('transpose', False)
+        opt_conv = dict(opt_conv)
+        transpose = opt_conv.pop("transpose", False)
+
         if separable:
-            if transpose or 'stride' in opt_conv.get('stride', 1) != 1:
-                raise ValueError('Separable convolutions cannot be '
-                                 'strided or transposed')
-            if isinstance(separable, str) and separable.lower().startswith('cross'):
-                conv_klass = CrossHairConv
+            stride = opt_conv.get("stride", 1)
+
+            if isinstance(stride, (list, tuple)):
+                is_strided = any(s != 1 for s in stride)
             else:
-                conv_klass = SeparableConv
+                is_strided = stride != 1
+
+            if transpose or is_strided:
+                raise ValueError(
+                    "Separable convolutions cannot be strided or transposed"
+                )
+
+            if isinstance(separable, str) and separable.lower().startswith("cross"):
+                conv_class = CrossHairConv
+            else:
+                conv_class = SeparableConv
         else:
-            conv_klass = (getattr(nn, f'ConvTranspose{ndim}d') if transpose else
-                          getattr(nn, f'Conv{ndim}d'))
-        opt_conv['kernel_size'] = utils.ensure_list(opt_conv['kernel_size'], ndim)
-        if 'dilation' in opt_conv:
-            opt_conv['dilation'] = utils.ensure_list(opt_conv['dilation'], ndim)
-        conv = conv_klass(in_channels, out_channels, **opt_conv)
-        return conv
+            conv_class = (
+                getattr(nn, f"ConvTranspose{ndim}d")
+                if transpose
+                else getattr(nn, f"Conv{ndim}d")
+            )
+
+        opt_conv["kernel_size"] = utils.ensure_list(
+            opt_conv["kernel_size"],
+            ndim,
+        )
+
+        if "dilation" in opt_conv:
+            opt_conv["dilation"] = utils.ensure_list(
+                opt_conv["dilation"],
+                ndim,
+            )
+
+        return conv_class(in_channels, out_channels, **opt_conv)
 
     @staticmethod
     def make_activation(activation):
-        #   an activation can be a class (typically a Module), which is
-        #   then instantiated, or a callable (an already instantiated
-        #   class or a more simple function).
-        #   it is useful to accept both these cases as they allow to either:
-        #       * have a learnable activation specific to this module
-        #       * have a learnable activation shared with other modules
-        #       * have a non-learnable activation
         if not activation:
             return None
+
         if isinstance(activation, str):
             activation = getattr(nn, activation)
-        activation = (activation() if inspect.isclass(activation)
-                      else activation if callable(activation)
-        else None)
-        return activation
+
+        if inspect.isclass(activation):
+            return activation()
+
+        if callable(activation):
+            return activation
+
+        return None
 
     @staticmethod
     def make_dropout(dropout, ndim):
-        dropout = (dropout() if inspect.isclass(dropout)
-                   else dropout if callable(dropout)
-        else getattr(nn, f'Dropout{ndim}d')(p=float(dropout)) if dropout
-        else None)
-        return dropout
+        if not dropout:
+            return None
+
+        if inspect.isclass(dropout):
+            return dropout()
+
+        if callable(dropout):
+            return dropout
+
+        return getattr(nn, f"Dropout{ndim}d")(p=float(dropout))
 
     @staticmethod
     def make_norm(norm, ndim, conv, order):
-        #   a normalization can be a class (typically a Module), which is
-        #   then instantiated, or a callable (an already instantiated
-        #   class or a more simple function).
         if not norm:
             return None
-        if isinstance(norm, bool) and norm:
-            norm = 'batch'
-        in_channels = (conv.in_channels if order.index('n') < order.index('c')
-                       else conv.out_channels)
+
+        if norm is True:
+            norm = "batch"
+
+        channels = (
+            conv.in_channels
+            if order.index("n") < order.index("c")
+            else conv.out_channels
+        )
+
         if isinstance(norm, str):
-            if 'instance' in norm.lower():
-                norm = getattr(nn, f'InstanceNorm{ndim}d')
-            elif 'layer' in norm.lower():
-                norm = nn.GroupNorm
-            elif 'batch' in norm.lower():
-                norm = getattr(nn, f'BatchNorm{ndim}d')
-        norm = (norm(in_channels, in_channels) if norm is nn.GroupNorm
-                else norm(in_channels) if inspect.isclass(norm)
-        else norm if callable(norm)
-        else None)
-        return norm
+            norm_name = norm.lower()
+
+            if "batch" in norm_name:
+                norm_class = getattr(nn, f"BatchNorm{ndim}d")
+                return norm_class(channels)
+
+            if "instance" in norm_name:
+                norm_class = getattr(nn, f"InstanceNorm{ndim}d")
+                return norm_class(channels, eps=1e-4)
+
+            if "layer" in norm_name:
+                return nn.GroupNorm(1, channels)
+
+            if "group" in norm_name:
+                return nn.GroupNorm(channels, channels)
+
+            raise ValueError(f"Unknown normalization type: {norm}")
+
+        if norm is nn.GroupNorm:
+            return norm(channels, channels)
+
+        if inspect.isclass(norm):
+            return norm(channels)
+
+        if callable(norm):
+            return norm
+
+        raise TypeError(f"Invalid normalization: {norm}")
 
 
 class ConvBlock(ConvBlockBase):
