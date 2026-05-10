@@ -1855,3 +1855,4 @@ class CLI(LightningCLI):
 
 if __name__ == '__main__':
     cli = CLI(Model, FCDDataModule, save_config_kwargs={"overwrite": True})
+
