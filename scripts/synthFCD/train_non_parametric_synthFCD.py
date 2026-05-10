@@ -123,7 +123,7 @@ class FCDDataset(Dataset):
         # Normalise fused_paths — None list when not native_synthesis
         if not fused_paths:
             fused_paths = [None] * len(label_paths)
-        
+
         for label_path, flair_path, roi_path, fused_path in zip(label_paths, flair_paths, roi_paths, fused_paths):
             subject_num = self._calc.get_subj_num(os.path.dirname(label_path))
             aug_matches = []
@@ -748,7 +748,7 @@ class SynthesisPipelineDebugger:
         self._log_stats(subject_id, "stage5_slab_with_fcd", slab_with_fcd)
         self._log_stats(subject_id, "stage5_rlab_with_fcd", rlab_with_fcd)
         print(f"[PipelineDebug] {subject_id} | Stage 5 (label fusion) saved → {out_dir}")
-        
+
     def save_stage6_after_intensity(self, subject_id: str, real_image_item: torch.Tensor):
         """Stage 6 — final rimg after IntensityTransform, normalized to [0,1]."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
@@ -1043,8 +1043,8 @@ class Model(pl.LightningModule):
         if aug_type == 'combo':
             return random.sample(['blur', 'zoom', 'hyper', 'trans'], random.randint(1, 4))
         return aug_type.split('+')
-     
-     
+
+
     def _apply_fcd_augmentations(
         self,
         img: torch.Tensor,
@@ -1087,22 +1087,21 @@ class Model(pl.LightningModule):
             'trans_intensity':  random.uniform(*params['int_rng']),
             'trans_sigma':      random.uniform(*params['trans_sigma']),
         }
-     
+
         # ── Apply augmentations using the pre-sampled values ─────────────────────
         for ch in choices:
             if ch == 'zoom':
-                print(f"[DEBUG] zoom_factor={pre['zoom_factor']:.4f}, shape={img.shape}")
                 img, roi = self.fcd_aug.apply_roi_thickening(
                     img, roi,
                     zoom_factor=pre['zoom_factor'],
                 )
-            
+
             elif ch == 'blur':
                 img = self.fcd_aug.apply_roi_augmentations_blured(
                     img, roi,
                     sigma=pre['blur_sigma'],
                 )
-     
+
             elif ch in ('hyper', 'trans'):
                 img = self.fcd_aug.apply_roi_augmentations_hyperintensity(
                     img, roi,
@@ -1116,7 +1115,7 @@ class Model(pl.LightningModule):
                       f"| params={pre}")
                 # Return the pre-augmentation image to avoid propagating NaN
                 return img, roi
-         
+
         return img, roi
 
     def _process_single_sample(self, batch: dict, i: int):
@@ -1137,7 +1136,7 @@ class Model(pl.LightningModule):
         roi_t      = batch['roi_t'][i]
         aug_type   = batch['aug_type'][i]
         subject_id = batch.get('subject_id', [None] * len(batch['label_t']))[i]
-        
+
         # Validate the actual synthesis input — fusedmask on native path, labelmap otherwise
         input_t = batch['fusedmask_t'][i] if self.hparams.native_synthesis else label_t
         if input_t.sum() == 0 or torch.isnan(input_t.float()).any():
@@ -1186,7 +1185,7 @@ class Model(pl.LightningModule):
             if not torch.isfinite(aug_image_item).all():
                 bad = (~torch.isfinite(aug_image_item)).sum().item()
                 print(f"[WARN] Stage 4 (IntensityTransform) produced {bad} non-finite voxels "
-                      f"for subject={subject_id}, aug={choices} — skipping sample")
+                      f"for subject={subject_id} — skipping sample")
                 return None   # synthesize_batch already handles None by skipping
 
 
@@ -1203,7 +1202,7 @@ class Model(pl.LightningModule):
 
             # ── Debug: Stage 6 — rimg after normalization + IntensityTransform ──────
             if is_debug:
-                dbg.save_stage6_after_intensity(subject_id, rimg_norm) 
+                dbg.save_stage6_after_intensity(subject_id, rimg_norm)
                 dbg.mark_saved(subject_id)
 
             return (
@@ -1212,7 +1211,7 @@ class Model(pl.LightningModule):
                 rimg_norm,
                 rlab_out.long(),
             )
-            
+
         # ── Augmented synthesis path (original) ───────────────────────────────────
         aug_params = {
             'int_rng':     (batch['int_factor_min'][i].item(),  batch['int_factor_max'][i].item()),
@@ -1270,7 +1269,7 @@ class Model(pl.LightningModule):
                 subject_id, slab_with_fcd.unsqueeze(0), rlab_with_fcd.unsqueeze(0)
             )
             dbg.mark_saved(subject_id)
-    
+
         rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
         rimg_norm = torch.clamp(rimg_norm / 218.0, 0.0, 1.0)
         rimg_out = self.intensity_aug(rimg_norm)
@@ -1278,7 +1277,7 @@ class Model(pl.LightningModule):
 
         # ── Debug: Stage 6 — rimg after normalization + IntensityTransform ──────────
         if is_debug:
-            dbg.save_stage6_after_intensity(subject_id, rimg_norm)  
+            dbg.save_stage6_after_intensity(subject_id, rimg_norm)
 
         return (
             aug_image_item,
@@ -1286,7 +1285,7 @@ class Model(pl.LightningModule):
             rimg_norm,
             rlab_with_fcd.unsqueeze(0),
         )
-    
+
     def synthesize_batch(self, batch: dict):
         """Run the synthesis pipeline for every sample. Returns stacked tensors."""
         results     = []
