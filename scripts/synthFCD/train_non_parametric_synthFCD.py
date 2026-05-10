@@ -532,14 +532,16 @@ class SharedSynth(torch.nn.Module):
         """
         if roi is not None:
             oh_slab = self._to_one_hot(slab)  # (19, D, H, W)
-            simg, _, (rimg, rlab, rroi) = self.synth(oh_slab, coreg=[img, lab, roi])
-            slab_out = self.remap_labels(slab)
+            simg, oh_slab_deformed, (rimg, rlab, rroi) = self.synth(oh_slab, coreg=[img, lab, roi])
+            slab_deformed = oh_slab_deformed.argmax(dim=0, keepdim=True)
+            slab_out = self.remap_labels(slab_deformed)
             rlab_out = self.remap_labels(rlab)
             return simg, slab_out, rimg, rlab_out, rroi
         else:
-            oh_slab = self._to_one_hot(slab, num_classes=22)  # (22, D, H, W) — label 21 gets its own channel
-            simg, _, (rimg, rlab) = self.synth(oh_slab, coreg=[img, lab])
-            slab_out = self.remap_labels(slab)
+            oh_slab = self._to_one_hot(slab, num_classes=22)
+            simg, oh_slab_deformed, (rimg, rlab) = self.synth(oh_slab, coreg=[img, lab])
+            slab_deformed = oh_slab_deformed.argmax(dim=0, keepdim=True)
+            slab_out = self.remap_labels(slab_deformed)
             rlab_out = self.remap_labels(rlab)
             return simg, slab_out, rimg, rlab_out, None
     # ------------------------------------------------------------------
@@ -746,6 +748,13 @@ class SynthesisPipelineDebugger:
         self._log_stats(subject_id, "stage5_slab_with_fcd", slab_with_fcd)
         self._log_stats(subject_id, "stage5_rlab_with_fcd", rlab_with_fcd)
         print(f"[PipelineDebug] {subject_id} | Stage 5 (label fusion) saved → {out_dir}")
+        
+    def save_stage6_after_intensity(self, subject_id: str, real_image_item: torch.Tensor):
+        """Stage 6 — final rimg after IntensityTransform, normalized to [0,1]."""
+        out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
+        self._save_nii(real_image_item.squeeze(), out_dir, "stage6_after_intensity.nii.gz", dtype=np.float32)
+        self._log_stats(subject_id, "stage6_after_intensity", real_image_item)
+        print(f"[PipelineDebug] {subject_id} | Stage 6 (intensity aug) saved → {out_dir}")
 
     def mark_saved(self, subject_id: str):
         """Call after all stages are saved to prevent re-saving this subject."""
@@ -1034,23 +1043,80 @@ class Model(pl.LightningModule):
         if aug_type == 'combo':
             return random.sample(['blur', 'zoom', 'hyper', 'trans'], random.randint(1, 4))
         return aug_type.split('+')
-
-    def _apply_fcd_augmentations(self, img: torch.Tensor, roi: torch.Tensor,
-                                 choices: list, params: dict) -> torch.Tensor:
-        """Apply the FCD augmentation chain. Returns a new tensor."""
+     
+     
+    def _apply_fcd_augmentations(
+        self,
+        img: torch.Tensor,
+        roi: torch.Tensor,
+        choices: list,
+        params: dict,
+    ) -> tuple:
+        """
+        Apply the FCD augmentation chain with pre-sampled random parameters.
+     
+        All random values are drawn here — once per subject, before any
+        augmentation method is invoked — so every subject is guaranteed a
+        statistically independent sample regardless of augmentation order.
+     
+        Parameters
+        ----------
+        img     : (Z, Y, X) synthetic image tensor on GPU
+        roi     : (Z, Y, X) binary ROI mask on GPU
+        choices : list of augmentation names, e.g. ['blur', 'hyper']
+        params  : dict of (min, max) range tuples from the batch:
+                    'int_rng'     → intensity_range for hyper / trans
+                    'blur_sigma'  → sigma_range for blur
+                    'zoom_f'      → zoom_factor range
+                    'hyper_sigma' → sigma_range for hyper
+                    'trans_sigma' → sigma_range for trans
+                    'tail_length' → (min_int, max_int) for trans tail
+     
+        Returns
+        -------
+        img : augmented image tensor
+        roi : (possibly updated) ROI mask tensor
+        """
+        # ── Pre-sample every random scalar up-front ──────────────────────────────
+        # Each draw is independent; order does not affect the values.
+        pre = {
+            'blur_sigma':       random.uniform(*params['blur_sigma']),
+            'zoom_factor':      random.uniform(*params['zoom_f']),
+            'hyper_intensity':  random.uniform(*params['int_rng']),
+            'hyper_sigma':      random.uniform(*params['hyper_sigma']),
+            'trans_intensity':  random.uniform(*params['int_rng']),
+            'trans_sigma':      random.uniform(*params['trans_sigma']),
+        }
+     
+        # ── Apply augmentations using the pre-sampled values ─────────────────────
         for ch in choices:
             if ch == 'zoom':
+                print(f"[DEBUG] zoom_factor={pre['zoom_factor']:.4f}, shape={img.shape}")
                 img, roi = self.fcd_aug.apply_roi_thickening(
-                    img, roi, zoom_range=params['zoom_f'])
+                    img, roi,
+                    zoom_factor=pre['zoom_factor'],
+                )
+            
+            elif ch == 'blur':
+                img = self.fcd_aug.apply_roi_augmentations_blured(
+                    img, roi,
+                    sigma=pre['blur_sigma'],
+                )
+     
             elif ch in ('hyper', 'trans'):
                 img = self.fcd_aug.apply_roi_augmentations_hyperintensity(
                     img, roi,
-                    intensity_range=params['int_rng'],
-                    sigma_range=params['hyper_sigma'] if ch == 'hyper' else params['trans_sigma'],
+                    intensity_factor=pre['hyper_intensity'],
+                    sigma=pre['hyper_sigma'],
                 )
-            elif ch == 'blur':
-                img = self.fcd_aug.apply_roi_augmentations_blured(
-                    img, roi, sigma_range=params['blur_sigma'])
+            # ── Debug: check for NaN/inf after every augmentation step ──────────
+            if not torch.isfinite(img).all():
+                bad = (~torch.isfinite(img)).sum().item()
+                print(f"[NaN DETECTED] after aug='{ch}' | bad_voxels={bad} "
+                      f"| params={pre}")
+                # Return the pre-augmentation image to avoid propagating NaN
+                return img, roi
+         
         return img, roi
 
     def _process_single_sample(self, batch: dict, i: int):
@@ -1109,13 +1175,20 @@ class Model(pl.LightningModule):
             simg_3d = simg.squeeze(0).float()
 
             if self.hparams.flair_modality:
-                simg_3d = torch.clamp(simg_3d / 255.0, 0.0, 1.0)
+                simg_3d = torch.clamp(simg_3d / 218.0, 0.0, 1.0)
                 # ── Debug: Stage 2 — after /255 clamp ─────────────────────────────
                 if is_debug:
                     dbg.save_stage2_after_clamp(subject_id, simg_3d)
 
             aug_out = self.intensity_aug(simg_3d.unsqueeze(0))
             aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
+            # ── Guard: catch NaN/inf introduced by IntensityTransform ─────────────────
+            if not torch.isfinite(aug_image_item).all():
+                bad = (~torch.isfinite(aug_image_item)).sum().item()
+                print(f"[WARN] Stage 4 (IntensityTransform) produced {bad} non-finite voxels "
+                      f"for subject={subject_id}, aug={choices} — skipping sample")
+                return None   # synthesize_batch already handles None by skipping
+
 
             # ── Debug: Stage 4 — after IntensityTransform ─────────────────────────
             if is_debug:
@@ -1123,13 +1196,23 @@ class Model(pl.LightningModule):
                 dbg.mark_saved(subject_id)
 
             # slab_out and rlab_out already have class 6 from remap_labels — no label fusion needed
+            rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
+            rimg_norm = torch.clamp(rimg_norm / 218.0, 0.0, 1.0)
+            rimg_out = self.intensity_aug(rimg_norm)
+            rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
+
+            # ── Debug: Stage 6 — rimg after normalization + IntensityTransform ──────
+            if is_debug:
+                dbg.save_stage6_after_intensity(subject_id, rimg_norm) 
+                dbg.mark_saved(subject_id)
+
             return (
                 aug_image_item,
                 slab_out.long(),
-                rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0),
+                rimg_norm,
                 rlab_out.long(),
             )
-
+            
         # ── Augmented synthesis path (original) ───────────────────────────────────
         aug_params = {
             'int_rng':     (batch['int_factor_min'][i].item(),  batch['int_factor_max'][i].item()),
@@ -1149,7 +1232,7 @@ class Model(pl.LightningModule):
             dbg.save_stage1_after_synth(subject_id, simg, slab, rimg, rlab, rroi)
 
         if self.hparams.flair_modality:
-            simg_3d = torch.clamp(simg_3d / 255.0, 0.0, 1.0)
+            simg_3d = torch.clamp(simg_3d / 218.0, 0.0, 1.0)
             # ── Debug: Stage 2 — after /255 clamp ─────────────────────────────────
             if is_debug:
                 dbg.save_stage2_after_clamp(subject_id, simg_3d)
@@ -1163,6 +1246,13 @@ class Model(pl.LightningModule):
 
         aug_out = self.intensity_aug(aug_img.float().unsqueeze(0))
         aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
+
+        # ── Guard: catch NaN/inf introduced by IntensityTransform ─────────────────
+        if not torch.isfinite(aug_image_item).all():
+            bad = (~torch.isfinite(aug_image_item)).sum().item()
+            print(f"[WARN] Stage 4 (IntensityTransform) produced {bad} non-finite voxels "
+                  f"for subject={subject_id}, aug={choices} — skipping sample")
+            return None
 
         # ── Debug: Stage 4 — after IntensityTransform ─────────────────────────────
         if is_debug:
@@ -1181,10 +1271,19 @@ class Model(pl.LightningModule):
             )
             dbg.mark_saved(subject_id)
     
+        rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
+        rimg_norm = torch.clamp(rimg_norm / 218.0, 0.0, 1.0)
+        rimg_out = self.intensity_aug(rimg_norm)
+        rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
+
+        # ── Debug: Stage 6 — rimg after normalization + IntensityTransform ──────────
+        if is_debug:
+            dbg.save_stage6_after_intensity(subject_id, rimg_norm)  
+
         return (
             aug_image_item,
             slab_with_fcd.unsqueeze(0),
-            rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0),
+            rimg_norm,
             rlab_with_fcd.unsqueeze(0),
         )
     
