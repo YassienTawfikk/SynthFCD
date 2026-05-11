@@ -1315,20 +1315,32 @@ class Model(pl.LightningModule):
     # ══════════════════════════════════════════════════════════════════════════
 
     def training_step(self, batch, batch_idx):
-        # Periodically free CUDA cache to prevent fragmentation over long runs
+        # Periodically free CUDA cache to prevent fragmentation
         if self.trainer.current_epoch % 10 == 0 and batch_idx == 0:
             torch.cuda.empty_cache()
 
+        # 1. Run synthesis pipeline
         result = self.synthesize_batch(batch)
+
+        # 2. Guard against empty batches (if all samples failed synthesis)
         if result is None:
             return None
+
         aug_image, aug_mask, real_image, real_mask = result
 
+        # 3. Explicitly get the actual batch size after potential skips
+        actual_batch_size = aug_image.shape[0]
+
+        # 4. Forward pass & Loss calculation
         loss_synth, loss_real = self.network.train_step(
-            aug_image, aug_mask, real_image, real_mask)
+            aug_image, aug_mask, real_image, real_mask
+        )
 
         loss = loss_synth + self.alpha * loss_real
-        self.log('train_loss', loss, prog_bar=True)
+
+        # 5. Log with explicit batch_size to silence warnings and ensure accuracy
+        self.log('train_loss', loss, prog_bar=True, batch_size=actual_batch_size)
+
         return loss
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1337,34 +1349,51 @@ class Model(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         with torch.no_grad():
+            # 1. Run synthesis pipeline
             result = self.synthesize_batch(batch)
+
+            # 2. Guard against empty batches
             if result is None:
                 return None
+
             aug_image, aug_mask, real_image, real_mask = result
 
-            loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
-                aug_image, aug_mask, real_image, real_mask)
+            # 3. Explicitly get the actual batch size
+            actual_batch_size = aug_image.shape[0]
 
-        pred_labels   = pred_real.cpu().argmax(dim=1)
+            # 4. Evaluation pass
+            loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
+                aug_image, aug_mask, real_image, real_mask
+            )
+
+        # 5. Process labels for metric computation
+        pred_labels = pred_real.cpu().argmax(dim=1)
         target_labels = real_mask.cpu().squeeze(1).long()
 
+        # 6. Update Dice metrics
         self.val_dice.update(pred_labels, target_labels)
         self.val_dice_fcd.update(pred_labels, target_labels)
 
+        # 7. Total validation loss
         loss = loss_synth + self.alpha * loss_real
-        self.log('eval_loss', loss, prog_bar=True)
 
-        # Cache for top-N best-batch NIfTI diagnostics
+        # 8. Log with explicit batch_size
+        self.log('eval_loss', loss, prog_bar=True, batch_size=actual_batch_size)
+
+        # 9. Cache for top-N best-batch NIfTI diagnostics
+        # We store these on CPU to save GPU memory during the validation loop
         self._val_batch_cache.append({
-            'pred_synth':    pred_synth.cpu(),
-            'pred_labels':   pred_labels,
-            'aug_image':     aug_image.cpu(),
-            'real_image':    real_image.cpu(),
-            'aug_mask':      aug_mask.cpu(),
+            'pred_synth': pred_synth.cpu(),
+            'pred_labels': pred_labels,
+            'aug_image': aug_image.cpu(),
+            'real_image': real_image.cpu(),
+            'aug_mask': aug_mask.cpu(),
             'target_labels': target_labels,
-            'score':         -loss.item(),  # lower loss = higher score
-            'batch_idx':     batch_idx,
+            'score': -loss.item(),  # Negative because lower loss is better
+            'batch_idx': batch_idx,
         })
+
+        # Keep only the top-N best batches based on loss
         self._val_batch_cache.sort(key=lambda x: x['score'], reverse=True)
         self._val_batch_cache = self._val_batch_cache[:self.n_best_batches]
 
