@@ -76,7 +76,6 @@ from learn2synth.configurations import (
 # ── FCDDataset ────────────────────────────────────────────────────────────────
 # Returns un-augmented volumes plus random augmentation configurations.
 # Actual GPU synthesis happens inside Model.synthesize_batch
-
 class FCDDataset(Dataset):
     def __init__(
             self,
@@ -202,6 +201,8 @@ class FCDDataset(Dataset):
             item['fusedmask_t'] = torch.as_tensor(fused_arr, dtype=torch.int64).unsqueeze(0)
 
         return item
+
+
 # ── FCDDataModule ─────────────────────────────────────────────────────────────
 #
 #  Source-aware split policy
@@ -223,7 +224,6 @@ class FCDDataset(Dataset):
 #    use_extra_data    (default False)          — set True to train on raw + extra
 #    val_from_raw_only (default False)          — set True to take validation from raw only
 # ──────────────────────────────────────────────────────────────────────────────
-
 class FCDDataModule(pl.LightningDataModule):
     def __init__(self,
                  ndim: int                     = 3,
@@ -416,10 +416,11 @@ class FCDDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(self.eval_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True, persistent_workers=self.num_workers > 0)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SharedSynth  —  geometry + GMM forward pass, intensity kept separate
 # ══════════════════════════════════════════════════════════════════════════════
-
 class SharedSynth(torch.nn.Module):
     """
     GMM synthesis + label remapping for the FCD segmentation pipeline.
@@ -588,6 +589,8 @@ class SharedSynth(torch.nn.Module):
             nb_classes += 1                           # +1 to accommodate class 6 (FCD lesion)
 
         return torch.clamp(lut[label_map.float().round().long()], 0, nb_classes - 1)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SynthesisPipelineDebugger
 # ──────────────────────────────────────────────────────────────────────────────
@@ -621,7 +624,6 @@ class SharedSynth(torch.nn.Module):
 #      stage5_label_fused_rlab.nii.gz    — rlab after label fusion (class 6 stamped, non-native)
 #      summary.txt                        — per-stage tensor stats (min/max/mean/shape)
 # ══════════════════════════════════════════════════════════════════════════════
-
 class SynthesisPipelineDebugger:
     """
     Saves intermediate volumes at every synthesis stage for selected subjects.
@@ -711,59 +713,52 @@ class SynthesisPipelineDebugger:
 
         print(f"[PipelineDebug] {subject_id} | Stage 1 saved → {out_dir}")
 
-    def save_stage2_after_clamp(self, subject_id: str, simg_clamped: torch.Tensor):
-        """Stage 2 — after /255 clamp to [0,1] on flair path (skipped on non-flair path)."""
-        out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(simg_clamped.squeeze(), out_dir, "stage2_after_clamp.nii.gz", dtype=np.float32)
-        self._log_stats(subject_id, "stage2_after_clamp", simg_clamped)
-        print(f"[PipelineDebug] {subject_id} | Stage 2 (clamp) saved → {out_dir}")
-
-    def save_stage3_after_fcd_aug(
+    def save_stage2_after_fcd_aug(
         self,
         subject_id: str,
         aug_img: torch.Tensor,
         rroi_3d: torch.Tensor,
         choices: list,
     ):
-        """Stage 3 — after FCDAugmentations (SynthFCD path only)."""
+        """Stage 2 — after FCDAugmentations (SynthFCD path only)."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
 
-        self._save_nii(aug_img.squeeze(), out_dir, "stage3_after_fcd_aug.nii.gz",     dtype=np.float32)
-        self._save_nii(rroi_3d.squeeze(), out_dir, "stage3_after_fcd_aug_roi.nii.gz", dtype=np.uint8)
+        self._save_nii(aug_img.squeeze(), out_dir, "stage2_after_fcd_aug.nii.gz",     dtype=np.float32)
+        self._save_nii(rroi_3d.squeeze(), out_dir, "stage2_after_fcd_aug_roi.nii.gz", dtype=np.uint8)
 
-        self._log_stats(subject_id, f"stage3_after_fcd_aug (choices={choices})", aug_img)
-        print(f"[PipelineDebug] {subject_id} | Stage 3 (FCD aug: {choices}) saved → {out_dir}")
+        self._log_stats(subject_id, f"stage2_after_fcd_aug (choices={choices})", aug_img)
+        print(f"[PipelineDebug] {subject_id} | Stage 2 (FCD aug: {choices}) saved → {out_dir}")
 
-    def save_stage4_after_intensity(self, subject_id: str, aug_image_item: torch.Tensor):
-        """Stage 4 — final aug_image_item after IntensityTransform, normalized to [0,1]."""
+    def save_stage3_after_intensity(self, subject_id: str, aug_image_item: torch.Tensor):
+        """Stage 3 — final aug_image_item after IntensityTransform, normalized to [0,1]."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(aug_image_item.squeeze(), out_dir, "stage4_after_intensity.nii.gz", dtype=np.float32)
-        self._log_stats(subject_id, "stage4_after_intensity", aug_image_item)
-        print(f"[PipelineDebug] {subject_id} | Stage 4 (intensity aug) saved → {out_dir}")
+        self._save_nii(aug_image_item.squeeze(), out_dir, "stage3_after_intensity.nii.gz", dtype=np.float32)
+        self._log_stats(subject_id, "stage3_after_intensity", aug_image_item)
+        print(f"[PipelineDebug] {subject_id} | Stage 3 (intensity aug) saved → {out_dir}")
 
-    def save_stage5_label_fusion(
+    def save_stage4_label_fusion(
         self,
         subject_id: str,
         slab_with_fcd: torch.Tensor,
         rlab_with_fcd: torch.Tensor,
     ):
-        """Stage 5 — after label fusion: ROI voxels stamped as class 6 (SynthFCD path only)."""
+        """Stage 4 — after label fusion: ROI voxels stamped as class 6 (SynthFCD path only)."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
 
-        self._save_nii(slab_with_fcd.squeeze(), out_dir, "stage5_label_fused_slab.nii.gz", dtype=np.int16)
-        self._save_nii(rlab_with_fcd.squeeze(), out_dir, "stage5_label_fused_rlab.nii.gz", dtype=np.int16)
+        self._save_nii(slab_with_fcd.squeeze(), out_dir, "stage4_label_fused_slab.nii.gz", dtype=np.int16)
+        self._save_nii(rlab_with_fcd.squeeze(), out_dir, "stage4_label_fused_rlab.nii.gz", dtype=np.int16)
 
-        self._log_stats(subject_id, "stage5_slab_with_fcd", slab_with_fcd)
-        self._log_stats(subject_id, "stage5_rlab_with_fcd", rlab_with_fcd)
+        self._log_stats(subject_id, "stage4_slab_with_fcd", slab_with_fcd)
+        self._log_stats(subject_id, "stage4_rlab_with_fcd", rlab_with_fcd)
 
-        print(f"[PipelineDebug] {subject_id} | Stage 5 (label fusion) saved → {out_dir}")
+        print(f"[PipelineDebug] {subject_id} | Stage 4 (label fusion) saved → {out_dir}")
 
-    def save_stage6_after_intensity(self, subject_id: str, real_image_item: torch.Tensor):
-        """Stage 6 — final rimg after IntensityTransform, normalized to [0,1]."""
+    def save_stage5_after_intensity(self, subject_id: str, real_image_item: torch.Tensor):
+        """Stage 5 — final rimg after IntensityTransform, normalized to [0,1]."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(real_image_item.squeeze(), out_dir, "stage6_after_intensity.nii.gz", dtype=np.float32)
-        self._log_stats(subject_id, "stage6_after_intensity", real_image_item)
-        print(f"[PipelineDebug] {subject_id} | Stage 6 (intensity aug) saved → {out_dir}")
+        self._save_nii(real_image_item.squeeze(), out_dir, "stage5_after_intensity.nii.gz", dtype=np.float32)
+        self._log_stats(subject_id, "stage5_after_intensity", real_image_item)
+        print(f"[PipelineDebug] {subject_id} | Stage 5 (intensity aug) saved → {out_dir}")
 
     def mark_saved(self, subject_id: str):
         """Call after all stages are saved to prevent re-saving this subject."""
@@ -807,6 +802,8 @@ class SynthesisPipelineDebugger:
                 f.write(line)
         except Exception as e:
             print(f"[PipelineDebug] WARNING: could not log stats for {stage_name}: {e}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Model  —  6-class grouped segmentation (brain structures + FCD lesion)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -881,7 +878,7 @@ class Model(pl.LightningModule):
         # ── Metrics ───────────────────────────────────────────────────────────
         _m                  = dict(include_background=False, num_classes=nb_classes, input_format='index')
         self.val_dice       = dice_compute(average='micro', **_m)
-        self.val_dice_fcd   = dice_compute(average='none', **_m)
+        self.val_dice_fcd   = dice_compute(average='none',  **_m)
 
         # ── Manual optimisation ───────────────────────────────────────────────
         self.automatic_optimization = False
@@ -1192,34 +1189,30 @@ class Model(pl.LightningModule):
             # simg exits SharedSynth already in [0,1] — no manual normalization needed
             simg_3d = simg.squeeze(0).float()
 
-            # ── Debug: Stage 2 — after SharedSynth normalization ──────────────────
-            if is_debug and self.hparams.flair_modality:
-                dbg.save_stage2_after_clamp(subject_id, simg_3d)
-
-            aug_out        = self.intensity_aug(simg_3d.unsqueeze(0))
+            aug_out = self.intensity_aug(simg_3d.unsqueeze(0))
             aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
 
             # ── Guard: catch NaN/inf introduced by IntensityTransform ─────────────
             if not torch.isfinite(aug_image_item).all():
                 bad = (~torch.isfinite(aug_image_item)).sum().item()
-                print(f"[WARN] Stage 4 (IntensityTransform) produced {bad} non-finite voxels "
+                print(f"[WARN] Stage 3 (IntensityTransform) produced {bad} non-finite voxels "
                       f"for subject={subject_id} — skipping sample")
                 return None
 
-            # ── Debug: Stage 4 — after IntensityTransform ─────────────────────────
+            # ── Debug: Stage 3 — after IntensityTransform ─────────────────────────
             if is_debug:
-                dbg.save_stage4_after_intensity(subject_id, aug_image_item)
+                dbg.save_stage3_after_intensity(subject_id, aug_image_item)
                 dbg.mark_saved(subject_id)
 
             # slab_out and rlab_out already have class 6 from remap_labels — no label fusion needed
             rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
             rimg_norm = self.rimg_normalizer.make_final(rimg_norm)(rimg_norm)
-            rimg_out  = self.intensity_aug(rimg_norm)
+            rimg_out = self.intensity_aug(rimg_norm)
             rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
 
-            # ── Debug: Stage 6 — rimg after normalization + IntensityTransform ──────
+            # ── Debug: Stage 5 — rimg after normalization + IntensityTransform ──────
             if is_debug:
-                dbg.save_stage6_after_intensity(subject_id, rimg_norm)
+                dbg.save_stage5_after_intensity(subject_id, rimg_norm)
                 dbg.mark_saved(subject_id)
 
             return (
@@ -1247,53 +1240,48 @@ class Model(pl.LightningModule):
         if is_debug:
             dbg.save_stage1_after_synth(subject_id, simg, slab, rimg, rlab, rroi)
 
-        # simg exits SharedSynth already in [0,1] — no manual normalization needed
-        # ── Debug: Stage 2 — after SharedSynth normalization ──────────────────────
-        if is_debug and self.hparams.flair_modality:
-            dbg.save_stage2_after_clamp(subject_id, simg_3d)
-
-        choices          = self._parse_aug_choices(aug_type)
+        choices = self._parse_aug_choices(aug_type)
         aug_img, rroi_3d = self._apply_fcd_augmentations(simg_3d.clone(), rroi_3d, choices, aug_params)
 
-        # ── Debug: Stage 3 — after FCDAugmentations ───────────────────────────────
+        # ── Debug: Stage 2 — after FCDAugmentations ───────────────────────────────
         if is_debug:
-            dbg.save_stage3_after_fcd_aug(subject_id, aug_img, rroi_3d, choices)
+            dbg.save_stage2_after_fcd_aug(subject_id, aug_img, rroi_3d, choices)
 
-        aug_out        = self.intensity_aug(aug_img.float().unsqueeze(0))
+        aug_out = self.intensity_aug(aug_img.float().unsqueeze(0))
         aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
 
         # ── Guard: catch NaN/inf introduced by IntensityTransform ─────────────────
         if not torch.isfinite(aug_image_item).all():
             bad = (~torch.isfinite(aug_image_item)).sum().item()
-            print(f"[WARN] Stage 4 (IntensityTransform) produced {bad} non-finite voxels "
+            print(f"[WARN] Stage 3 (IntensityTransform) produced {bad} non-finite voxels "
                   f"for subject={subject_id}, aug={choices} — skipping sample")
             return None
 
-        # ── Debug: Stage 4 — after IntensityTransform ─────────────────────────────
+        # ── Debug: Stage 3 — after IntensityTransform ─────────────────────────────
         if is_debug:
-            dbg.save_stage4_after_intensity(subject_id, aug_image_item)
+            dbg.save_stage3_after_intensity(subject_id, aug_image_item)
 
-        slab_with_fcd              = slab_3d.clone()
+        slab_with_fcd = slab_3d.clone()
         slab_with_fcd[rroi_3d > 0] = 6
 
-        rlab_with_fcd              = rlab.long().squeeze(0).clone()
+        rlab_with_fcd = rlab.long().squeeze(0).clone()
         rlab_with_fcd[rroi_3d > 0] = 6
 
-        # ── Debug: Stage 5 — after label fusion ───────────────────────────────────
+        # ── Debug: Stage 4 — after label fusion ───────────────────────────────────
         if is_debug:
-            dbg.save_stage5_label_fusion(
+            dbg.save_stage4_label_fusion(
                 subject_id, slab_with_fcd.unsqueeze(0), rlab_with_fcd.unsqueeze(0)
             )
             dbg.mark_saved(subject_id)
 
         rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
         rimg_norm = self.rimg_normalizer.make_final(rimg_norm)(rimg_norm)
-        rimg_out  = self.intensity_aug(rimg_norm)
+        rimg_out = self.intensity_aug(rimg_norm)
         rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
 
-        # ── Debug: Stage 6 — rimg after normalization + IntensityTransform ──────────
+        # ── Debug: Stage 5 — rimg after normalization + IntensityTransform ──────────
         if is_debug:
-            dbg.save_stage6_after_intensity(subject_id, rimg_norm)
+            dbg.save_stage5_after_intensity(subject_id, rimg_norm)
 
         return (
             aug_image_item,
@@ -1472,13 +1460,16 @@ class Model(pl.LightningModule):
 
     def forward(self, x):
         return self.network.segnet(x)
-# ── Helper Functions ──────────────────────────────────────────────────────────
 
+
+# ── Helper Functions ──────────────────────────────────────────────────────────
 def save(dat, fname):
     dat = dat.detach().cpu().numpy()
     h = nib.Nifti1Header()
     h.set_data_dtype(dat.dtype)
     nib.save(nib.Nifti1Image(dat, np.eye(4), h), fname)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  TimeLimitCallback
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1512,6 +1503,7 @@ class TimeLimitCallback(Callback):
                       f"({elapsed / 60:.1f} > {self.limit_minutes} mins). "
                       f"Stopping after this epoch.")
                 trainer.should_stop = True
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LossGraphCallback
@@ -1726,6 +1718,7 @@ class LossGraphCallback(Callback):
                   f"{type(e).__name__}: {e}")
             traceback.print_exc()
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  EveryEpochCheckpointCallback
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1754,6 +1747,7 @@ class EveryEpochCheckpointCallback(Callback):
             print(f"[EveryEpoch] ❌ Save FAILED at epoch "
                   f"{trainer.current_epoch}: {type(e).__name__}: {e}")
             traceback.print_exc()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CheckpointTraceCallback
@@ -1806,8 +1800,8 @@ class CheckpointTraceCallback(Callback):
         print(f"\n[CKPT TRACE] ❌ EXCEPTION: {type(exception).__name__}: {exception}")
         traceback.print_exc()
 
-# ── CLI & Main ────────────────────────────────────────────────────────────────
 
+# ── CLI & Main ────────────────────────────────────────────────────────────────
 class CLI(LightningCLI):
     def add_arguments_to_parser(self, parser):
         parser.add_lightning_class_args(ModelCheckpoint, "checkpoint")
