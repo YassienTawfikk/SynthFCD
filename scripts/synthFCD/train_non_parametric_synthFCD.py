@@ -1,4 +1,5 @@
 """FCD SynthSeg – 7-class FCD lesion segmentation (background + 5 tissue groups + FCD lesion)."""
+
 # ── Standard library ────────────────────────────────────────────────────────
 import os
 import sys
@@ -8,28 +9,28 @@ import random
 import shutil
 import datetime
 import traceback
-from typing import Sequence, Optional
 
-from os import path, makedirs
+from typing import Sequence, Optional
+from os     import path, makedirs
 from random import shuffle
 
 # ── Third-party libraries ───────────────────────────────────────────────────
-import numpy as np
-import pandas as pd
+import numpy             as np
+import pandas            as pd
 import torch
 import matplotlib.pyplot as plt
-import nibabel as nib
+import nibabel           as nib
 
-import pytorch_lightning as pl
-from pytorch_lightning.cli import LightningCLI
+import pytorch_lightning         as pl
+from pytorch_lightning.cli       import LightningCLI
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback
-from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
+from pytorch_lightning.loggers   import CSVLogger, TensorBoardLogger
 
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data          import Dataset, DataLoader
 from torchmetrics.segmentation import DiceScore as dice_compute
 
-import cornucopia as cc
-from cornucopia import SynthFromLabelTransform, IntensityTransform
+import cornucopia       as cc
+from cornucopia         import SynthFromLabelTransform, IntensityTransform
 from cornucopia.special import IdentityTransform
 
 # NOTE: GaussianSmooth is currently unused → remove if not needed
@@ -40,15 +41,16 @@ from cornucopia.special import IdentityTransform
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_root)
 
+
 # ── Local modules (learn2synth) ─────────────────────────────────────────────
-from learn2synth.networks import UNet, SegNet
-from learn2synth.train import SynthSeg
-from learn2synth.losses import (
+from learn2synth.networks      import UNet, SegNet
+from learn2synth.train         import SynthSeg
+from learn2synth.losses        import (
     DiceLoss, LogitMSELoss, CatLoss, CatMSELoss,
     DiceCELoss, FocalTverskyLoss,
 )
-from learn2synth import optim
-from learn2synth.parameters import FCDParameterCalculator
+from learn2synth               import optim
+from learn2synth.parameters    import FCDParameterCalculator
 from learn2synth.augmentations import FCDAugmentations
 
 from learn2synth.custom_cc_synthseg import (
@@ -71,8 +73,6 @@ from learn2synth.configurations import (
     BLUR_SUBJECTS,
     THICKENING_SUBJECTS,
 )
-
-
 # ── FCDDataset ────────────────────────────────────────────────────────────────
 # Returns un-augmented volumes plus random augmentation configurations.
 # Actual GPU synthesis happens inside Model.synthesize_batch
@@ -83,14 +83,14 @@ class FCDDataset(Dataset):
             label_paths,
             flair_paths,
             roi_paths,
-            fused_paths=None,
-            native_synthesis: bool = False,
-            fcd_intensity_range=(0.02, 0.3602),
-            fcd_tail_length_range=(20, 50),
-            blur_sigma_range=(0.7, 1.7),
-            zoom_f_range=(0.75, 0.95),
-            hyper_sigma_range=(0.0, 0.3),
-            trans_sigma_range=(0.0, 0.3)
+            fused_paths                  = None,
+            native_synthesis: bool       = False,
+            fcd_intensity_range          = (0.02, 0.3602),
+            fcd_tail_length_range        = (20, 50),
+            blur_sigma_range             = (0.7, 1.7),
+            zoom_f_range                 = (0.75, 0.95),
+            hyper_sigma_range            = (0.0, 0.3),
+            trans_sigma_range            = (0.0, 0.3)
     ):
         """
         Args:
@@ -103,27 +103,27 @@ class FCDDataset(Dataset):
             hyper_sigma_range: Range for gray matter hyperintensity noise.
             trans_sigma_range: Range for transmantle signal intensity noise.
         """
-        self.ndim = ndim
-        self.native_synthesis = native_synthesis
+        self.ndim                  = ndim
+        self.native_synthesis      = native_synthesis
 
-        self.fcd_intensity_range = fcd_intensity_range
+        self.fcd_intensity_range   = fcd_intensity_range
         self.fcd_tail_length_range = fcd_tail_length_range
 
         # Store augmentation hyperparameters for external configurability
-        self.blur_sigma_range = blur_sigma_range
-        self.zoom_f_range = zoom_f_range
-        self.hyper_sigma_range = hyper_sigma_range
-        self.trans_sigma_range = trans_sigma_range
+        self.blur_sigma_range      = blur_sigma_range
+        self.zoom_f_range          = zoom_f_range
+        self.hyper_sigma_range     = hyper_sigma_range
+        self.trans_sigma_range     = trans_sigma_range
 
-        self.items = []
+        self.items                 = []
 
         # Initialize stateless utility once to minimize instantiation overhead during loading
-        self._calc = FCDParameterCalculator()
+        self._calc                 = FCDParameterCalculator()
 
         # Normalise fused_paths — None list when not native_synthesis
         if not fused_paths:
             fused_paths = [None] * len(label_paths)
-        
+
         for label_path, flair_path, roi_path, fused_path in zip(label_paths, flair_paths, roi_paths, fused_paths):
             subject_num = self._calc.get_subj_num(os.path.dirname(label_path))
             aug_matches = []
@@ -146,12 +146,12 @@ class FCDDataset(Dataset):
         # --- Volume Loading (I/O) ---
         flair_arr = nib.load(flair_path).get_fdata()
         label_arr = nib.load(label_path).get_fdata().astype(int)
-        roi_arr = nib.load(roi_path).get_fdata().astype(int)
+        roi_arr   = nib.load(roi_path).get_fdata().astype(int)
 
         # --- Spatial Standardization ---
         # Resample ROI and labels to match FLAIR space using shared utility instance
         if flair_arr.shape != roi_arr.shape:
-            roi_arr = (self._calc.resample_to_target(roi_arr, flair_arr.shape, True) > 0.5).astype(int)
+            roi_arr   = (self._calc.resample_to_target(roi_arr, flair_arr.shape, True) > 0.5).astype(int)
         if flair_arr.shape != label_arr.shape:
             label_arr = self._calc.resample_to_target(label_arr, flair_arr.shape, True).astype(int)
 
@@ -159,35 +159,35 @@ class FCDDataset(Dataset):
         # Data is prepared for the CNN pipeline (C, H, W, D format)
         label_tensor = torch.as_tensor(label_arr, dtype=torch.int64).unsqueeze(0)
         flair_tensor = torch.as_tensor(flair_arr, dtype=torch.float32).unsqueeze(0)
-        roi_tensor = torch.as_tensor(roi_arr, dtype=torch.int64).unsqueeze(0)
+        roi_tensor   = torch.as_tensor(roi_arr,   dtype=torch.int64).unsqueeze(0)
 
         # --- Parameter Exposure ---
         # Construct augmentation parameters from instance ranges.
         # These are passed as tensors to ensure consistency across worker processes.
         aug_params = {
-            'int_factor_min': torch.tensor(self.fcd_intensity_range[0], dtype=torch.float32),
-            'int_factor_max': torch.tensor(self.fcd_intensity_range[1], dtype=torch.float32),
+            'int_factor_min':  torch.tensor(self.fcd_intensity_range[0],   dtype=torch.float32),
+            'int_factor_max':  torch.tensor(self.fcd_intensity_range[1],   dtype=torch.float32),
             'tail_length_min': torch.tensor(self.fcd_tail_length_range[0], dtype=torch.long),
             'tail_length_max': torch.tensor(self.fcd_tail_length_range[1], dtype=torch.long),
 
-            'blur_sigma_min': torch.tensor(self.blur_sigma_range[0], dtype=torch.float32),
-            'blur_sigma_max': torch.tensor(self.blur_sigma_range[1], dtype=torch.float32),
+            'blur_sigma_min':  torch.tensor(self.blur_sigma_range[0],      dtype=torch.float32),
+            'blur_sigma_max':  torch.tensor(self.blur_sigma_range[1],      dtype=torch.float32),
 
-            'zoom_f_min': torch.tensor(self.zoom_f_range[0], dtype=torch.float32),
-            'zoom_f_max': torch.tensor(self.zoom_f_range[1], dtype=torch.float32),
+            'zoom_f_min':      torch.tensor(self.zoom_f_range[0],          dtype=torch.float32),
+            'zoom_f_max':      torch.tensor(self.zoom_f_range[1],          dtype=torch.float32),
 
-            'hyper_sigma_min': torch.tensor(self.hyper_sigma_range[0], dtype=torch.float32),
-            'hyper_sigma_max': torch.tensor(self.hyper_sigma_range[1], dtype=torch.float32),
+            'hyper_sigma_min': torch.tensor(self.hyper_sigma_range[0],     dtype=torch.float32),
+            'hyper_sigma_max': torch.tensor(self.hyper_sigma_range[1],     dtype=torch.float32),
 
-            'trans_sigma_min': torch.tensor(self.trans_sigma_range[0], dtype=torch.float32),
-            'trans_sigma_max': torch.tensor(self.trans_sigma_range[1], dtype=torch.float32),
+            'trans_sigma_min': torch.tensor(self.trans_sigma_range[0],     dtype=torch.float32),
+            'trans_sigma_max': torch.tensor(self.trans_sigma_range[1],     dtype=torch.float32),
         }
 
         item = {
-            'label_t': label_tensor,
-            'flair_t': flair_tensor,
-            'roi_t': roi_tensor,
-            'aug_type': aug_type,
+            'label_t':    label_tensor,
+            'flair_t':    flair_tensor,
+            'roi_t':      roi_tensor,
+            'aug_type':   aug_type,
             'subject_id': os.path.basename(os.path.dirname(label_path)),
             **aug_params,
         }
@@ -226,41 +226,41 @@ class FCDDataset(Dataset):
 # ──────────────────────────────────────────────────────────────────────────────
 class FCDDataModule(pl.LightningDataModule):
     def __init__(self,
-                 ndim: int = 3,
-                 dataset_path: str = DEFAULT_FOLDER,
-                 eval: float = 0.04,
-                 preshuffle: bool = False,
-                 batch_size: int = 1,
-                 shuffle: bool = True,
-                 num_workers: int = 4,
-                 native_synthesis: bool = False,
-                 train_subdir: str = 'train',
-                 raw_subdir: Optional[str] = 'raw',
+                 ndim: int                     = 3,
+                 dataset_path: str             = DEFAULT_FOLDER,
+                 eval: float                   = 0.04,
+                 preshuffle: bool              = False,
+                 batch_size: int               = 1,
+                 shuffle: bool                 = True,
+                 num_workers: int              = 4,
+                 native_synthesis: bool        = False,
+                 train_subdir: str             = 'train',
+                 raw_subdir: Optional[str]     = 'raw',
                  extra_subdirs: Optional[list] = None,
-                 use_extra_data: bool = False):
+                 use_extra_data: bool          = False):
         super().__init__()
 
         # --- Config ---
-        self.ndim = ndim
-        self.dataset_path = dataset_path
-        self.eval_frac = eval
-        self.preshuffle = preshuffle
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.num_workers = num_workers
+        self.ndim             = ndim
+        self.dataset_path     = dataset_path
+        self.eval_frac        = eval
+        self.preshuffle       = preshuffle
+        self.batch_size       = batch_size
+        self.shuffle          = shuffle
+        self.num_workers      = num_workers
         self.native_synthesis = native_synthesis
-        self.use_extra_data = use_extra_data
+        self.use_extra_data   = use_extra_data
 
         # --- Resolve directory layout ---
         if raw_subdir is None:
-            self.use_extra_data = False
+            self.use_extra_data    = False
             self.val_from_raw_only = False
             print("[FCDDataModule] raw_subdir=None — scanning train_subdir directly, use_extra_data forced False.")
         elif extra_subdirs is None:
-            extra_subdirs = ['generated']
+            extra_subdirs          = ['generated']
 
-        train_root = path.join(dataset_path, train_subdir)
-        raw_root = train_root if raw_subdir is None else path.join(train_root, raw_subdir)
+        train_root  = path.join(dataset_path, train_subdir)
+        raw_root    = train_root if raw_subdir is None else path.join(train_root, raw_subdir)
         extra_roots = [path.join(train_root, s) for s in extra_subdirs] if extra_subdirs else []
 
         # --- Helper: scan one directory for valid triplets (+ fusedmask when native_synthesis) ---
@@ -316,12 +316,12 @@ class FCDDataModule(pl.LightningDataModule):
         # --- Store split-ready pools ---
         self._raw_label_paths = raw_label_paths
         self._raw_flair_paths = raw_flair_paths
-        self._raw_roi_paths = raw_roi_paths
+        self._raw_roi_paths   = raw_roi_paths
         self._raw_fused_paths = raw_fused_paths
 
         self._extra_label_paths = extra_label_paths
         self._extra_flair_paths = extra_flair_paths
-        self._extra_roi_paths = extra_roi_paths
+        self._extra_roi_paths   = extra_roi_paths
         self._extra_fused_paths = extra_fused_paths
 
         print(
@@ -334,18 +334,18 @@ class FCDDataModule(pl.LightningDataModule):
             print("[FCDDataModule] Computing FCD augmentation parameters…")
             self._calc = FCDParameterCalculator()
             self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(
-                dataset_path=raw_root,
-                label_file=label_file,
-                flair_file=flair_file,
-                roi_file=roi_file,
-                intensity_subjects=INTENSITY_SUBJECTS,
-                transmantle_subjects=TRANSMANTLE_SUBJECTS,
-                auto_resample=True,
+                dataset_path         = raw_root,
+                label_file           = label_file,
+                flair_file           = flair_file,
+                roi_file             = roi_file,
+                intensity_subjects   = INTENSITY_SUBJECTS,
+                transmantle_subjects = TRANSMANTLE_SUBJECTS,
+                auto_resample        = True,
             )
         else:
             print("[FCDDataModule] native_synthesis=True — skipping FCD augmentation parameter computation.")
             self.fcd_intensity_range = (0.0, 0.0)
-            self.fcd_tail_range = (0, 0)
+            self.fcd_tail_range      = (0, 0)
 
     def setup(self, stage=None):
         if hasattr(self, '_setup_done'):
@@ -355,7 +355,7 @@ class FCDDataModule(pl.LightningDataModule):
         # Copy raw pool (and shuffle if requested) before splitting
         raw_label_paths = list(self._raw_label_paths)
         raw_flair_paths = list(self._raw_flair_paths)
-        raw_roi_paths = list(self._raw_roi_paths)
+        raw_roi_paths   = list(self._raw_roi_paths)
         raw_fused_paths = list(self._raw_fused_paths)
 
         if self.preshuffle:
@@ -373,18 +373,18 @@ class FCDDataModule(pl.LightningDataModule):
 
         val_label_paths = raw_label_paths[:n_val]
         val_flair_paths = raw_flair_paths[:n_val]
-        val_roi_paths = raw_roi_paths[:n_val]
+        val_roi_paths   = raw_roi_paths[:n_val]
         val_fused_paths = raw_fused_paths[:n_val]  # ← fixed
 
         train_raw_label_paths = raw_label_paths[n_val:]
         train_raw_flair_paths = raw_flair_paths[n_val:]
-        train_raw_roi_paths = raw_roi_paths[n_val:]
+        train_raw_roi_paths   = raw_roi_paths[n_val:]
         train_raw_fused_paths = raw_fused_paths[n_val:]  # ← fixed
 
         # Training set = remaining raw + all extra
         train_label_paths = train_raw_label_paths + list(self._extra_label_paths)
         train_flair_paths = train_raw_flair_paths + list(self._extra_flair_paths)
-        train_roi_paths = train_raw_roi_paths + list(self._extra_roi_paths)
+        train_roi_paths   = train_raw_roi_paths   + list(self._extra_roi_paths)
         train_fused_paths = train_raw_fused_paths + list(self._extra_fused_paths)  # ← fixed
 
         print(
@@ -394,30 +394,28 @@ class FCDDataModule(pl.LightningDataModule):
         )
 
         kw = dict(
-            fcd_intensity_range=self.fcd_intensity_range,
-            fcd_tail_length_range=self.fcd_tail_range,
+            fcd_intensity_range   = self.fcd_intensity_range,
+            fcd_tail_length_range = self.fcd_tail_range,
         )
 
         self.train_ds = FCDDataset(
             self.ndim, train_label_paths, train_flair_paths, train_roi_paths,
-            fused_paths=train_fused_paths,
-            native_synthesis=self.native_synthesis,
+            fused_paths      = train_fused_paths,
+            native_synthesis = self.native_synthesis,
             **kw,
         )
         self.eval_ds = FCDDataset(
             self.ndim, val_label_paths, val_flair_paths, val_roi_paths,
-            fused_paths=val_fused_paths,
-            native_synthesis=self.native_synthesis,
+            fused_paths      = val_fused_paths,
+            native_synthesis = self.native_synthesis,
             **kw,
         )
 
     def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=self.shuffle, num_workers=self.num_workers, pin_memory=True,
-                          persistent_workers=self.num_workers > 0)
+        return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=self.shuffle, num_workers=self.num_workers, pin_memory=True, persistent_workers=self.num_workers > 0)
 
     def val_dataloader(self):
-        return DataLoader(self.eval_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True,
-                          persistent_workers=self.num_workers > 0)
+        return DataLoader(self.eval_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True, persistent_workers=self.num_workers > 0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -437,8 +435,8 @@ class SharedSynth(torch.nn.Module):
 
     def __init__(self, synth, target_labels=None, native_synthesis: bool = False):
         super().__init__()
-        self.synth = synth
-        self.target_labels = target_labels or []
+        self.synth            = synth
+        self.target_labels    = target_labels or []
         self.native_synthesis = native_synthesis
 
     # ------------------------------------------------------------------
@@ -504,13 +502,13 @@ class SharedSynth(torch.nn.Module):
         else:
             slab_synth = slab
 
-        final = self.synth.make_final(slab_synth, 1)
+        final        = self.synth.make_final(slab_synth, 1)
         final.deform = final.deform.make_final(slab_synth)
         simg, slab_out = final(slab_synth)
 
         if roi is not None:
             rimg, rlab, rroi = final.deform([img, lab, roi])
-            rlab = final.postproc(rlab)
+            rlab             = final.postproc(rlab)
             return simg, slab_out, rimg, rlab, rroi
         else:
             rimg, rlab = final.deform([img, lab])
@@ -531,19 +529,20 @@ class SharedSynth(torch.nn.Module):
                                  already encoded as label 21 and remapped to class 6.
         """
         if roi is not None:
-            oh_slab = self._to_one_hot(slab)  # (19, D, H, W)
+            oh_slab                                    = self._to_one_hot(slab)  # (19, D, H, W)
             simg, oh_slab_deformed, (rimg, rlab, rroi) = self.synth(oh_slab, coreg=[img, lab, roi])
-            slab_deformed = oh_slab_deformed.argmax(dim=0, keepdim=True)
-            slab_out = self.remap_labels(slab_deformed)
-            rlab_out = self.remap_labels(rlab)
+            slab_deformed                              = oh_slab_deformed.argmax(dim=0, keepdim=True)
+            slab_out                                   = self.remap_labels(slab_deformed)
+            rlab_out                                   = self.remap_labels(rlab)
             return simg, slab_out, rimg, rlab_out, rroi
         else:
-            oh_slab = self._to_one_hot(slab, num_classes=22)
+            oh_slab                              = self._to_one_hot(slab, num_classes=22)
             simg, oh_slab_deformed, (rimg, rlab) = self.synth(oh_slab, coreg=[img, lab])
-            slab_deformed = oh_slab_deformed.argmax(dim=0, keepdim=True)
-            slab_out = self.remap_labels(slab_deformed)
-            rlab_out = self.remap_labels(rlab)
+            slab_deformed                        = oh_slab_deformed.argmax(dim=0, keepdim=True)
+            slab_out                             = self.remap_labels(slab_deformed)
+            rlab_out                             = self.remap_labels(rlab)
             return simg, slab_out, rimg, rlab_out, None
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -575,7 +574,7 @@ class SharedSynth(torch.nn.Module):
             all else → class 0 (Background)
         """
         max_value = int(label_map.max().item()) + 1
-        lut = torch.zeros(max_value, dtype=torch.long, device=label_map.device)
+        lut       = torch.zeros(max_value, dtype=torch.long, device=label_map.device)
 
         for class_index, group in enumerate(self.target_labels, start=1):
             for value in group:
@@ -583,12 +582,14 @@ class SharedSynth(torch.nn.Module):
                     lut[value] = class_index
 
         if self.native_synthesis and 21 < max_value:
-            lut[21] = 6  # FCD lesion remapped from fusedmask label 21
-        nb_classes = len(self.target_labels) + 1  # 6: background + 5 tissues
+            lut[21] = 6                               # FCD lesion remapped from fusedmask label 21
+
+        nb_classes = len(self.target_labels) + 1      # 6: background + 5 tissues
         if self.native_synthesis:
-            nb_classes += 1  # +1 to accommodate class 6 (FCD lesion)
+            nb_classes += 1                           # +1 to accommodate class 6 (FCD lesion)
 
         return torch.clamp(lut[label_map.float().round().long()], 0, nb_classes - 1)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SynthesisPipelineDebugger
@@ -623,7 +624,6 @@ class SharedSynth(torch.nn.Module):
 #      stage5_label_fused_rlab.nii.gz    — rlab after label fusion (class 6 stamped, non-native)
 #      summary.txt                        — per-stage tensor stats (min/max/mean/shape)
 # ══════════════════════════════════════════════════════════════════════════════
-
 class SynthesisPipelineDebugger:
     """
     Saves intermediate volumes at every synthesis stage for selected subjects.
@@ -646,10 +646,10 @@ class SynthesisPipelineDebugger:
         output_root: str,
         save_once_per_subject: bool = True,
     ):
-        self.debug_subject_ids = set(debug_subject_ids)
-        self.output_root = output_root
-        self.save_once = save_once_per_subject
-        self._saved: set = set()  # tracks which subjects have already been saved
+        self.debug_subject_ids     = set(debug_subject_ids)
+        self.output_root           = output_root
+        self.save_once             = save_once_per_subject
+        self._saved: set           = set()  # tracks which subjects have already been saved
         self._aug_type_cache: dict = {}
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -672,16 +672,19 @@ class SynthesisPipelineDebugger:
     ):
         """Stage 0 — raw tensors loaded from disk, before any processing."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(label_t.squeeze(),  out_dir, "stage0_input_labelmap.nii.gz",  dtype=np.int16)
-        self._save_nii(flair_t.squeeze(),  out_dir, "stage0_input_flair.nii.gz",     dtype=np.float32)
-        self._save_nii(roi_t.squeeze(),    out_dir, "stage0_input_roi.nii.gz",        dtype=np.uint8)
+
+        self._save_nii(label_t.squeeze(), out_dir, "stage0_input_labelmap.nii.gz", dtype=np.int16)
+        self._save_nii(flair_t.squeeze(), out_dir, "stage0_input_flair.nii.gz",    dtype=np.float32)
+        self._save_nii(roi_t.squeeze(),   out_dir, "stage0_input_roi.nii.gz",      dtype=np.uint8)
         if fusedmask_t is not None:
             self._save_nii(fusedmask_t.squeeze(), out_dir, "stage0_input_fusedmask.nii.gz", dtype=np.int16)
+
         self._log_stats(subject_id, "stage0_input_labelmap",  label_t)
         self._log_stats(subject_id, "stage0_input_flair",     flair_t)
         self._log_stats(subject_id, "stage0_input_roi",       roi_t)
         if fusedmask_t is not None:
             self._log_stats(subject_id, "stage0_input_fusedmask", fusedmask_t)
+
         print(f"[PipelineDebug] {subject_id} | Stage 0 saved → {out_dir}")
 
     def save_stage1_after_synth(
@@ -695,66 +698,67 @@ class SynthesisPipelineDebugger:
     ):
         """Stage 1 — output of SharedSynth: deformed + GMM-sampled synthetic image."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(simg.squeeze(),    out_dir, "stage1_after_synth_simg.nii.gz",  dtype=np.float32)
-        self._save_nii(slab_out.squeeze(),out_dir, "stage1_after_synth_slab.nii.gz",  dtype=np.int16)
-        self._save_nii(rimg.squeeze(),    out_dir, "stage1_after_synth_rimg.nii.gz",  dtype=np.float32)
-        self._save_nii(rlab_out.squeeze(),out_dir, "stage1_after_synth_rlab.nii.gz",  dtype=np.int16)
+
+        self._save_nii(simg.squeeze(),     out_dir, "stage1_after_synth_simg.nii.gz", dtype=np.float32)
+        self._save_nii(slab_out.squeeze(), out_dir, "stage1_after_synth_slab.nii.gz", dtype=np.int16)
+        self._save_nii(rimg.squeeze(),     out_dir, "stage1_after_synth_rimg.nii.gz", dtype=np.float32)
+        self._save_nii(rlab_out.squeeze(), out_dir, "stage1_after_synth_rlab.nii.gz", dtype=np.int16)
         if rroi is not None:
             self._save_nii(rroi.squeeze(), out_dir, "stage1_after_synth_rroi.nii.gz", dtype=np.uint8)
-        self._log_stats(subject_id, "stage1_simg",    simg)
-        self._log_stats(subject_id, "stage1_slab_out",slab_out)
-        self._log_stats(subject_id, "stage1_rimg",    rimg)
-        self._log_stats(subject_id, "stage1_rlab_out",rlab_out)
+
+        self._log_stats(subject_id, "stage1_simg",     simg)
+        self._log_stats(subject_id, "stage1_slab_out", slab_out)
+        self._log_stats(subject_id, "stage1_rimg",     rimg)
+        self._log_stats(subject_id, "stage1_rlab_out", rlab_out)
+
         print(f"[PipelineDebug] {subject_id} | Stage 1 saved → {out_dir}")
 
-    def save_stage2_after_clamp(self, subject_id: str, simg_clamped: torch.Tensor):
-        """Stage 2 — after /255 clamp to [0,1] on flair path (skipped on non-flair path)."""
-        out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(simg_clamped.squeeze(), out_dir, "stage2_after_clamp.nii.gz", dtype=np.float32)
-        self._log_stats(subject_id, "stage2_after_clamp", simg_clamped)
-        print(f"[PipelineDebug] {subject_id} | Stage 2 (clamp) saved → {out_dir}")
-
-    def save_stage3_after_fcd_aug(
+    def save_stage2_after_fcd_aug(
         self,
         subject_id: str,
         aug_img: torch.Tensor,
         rroi_3d: torch.Tensor,
         choices: list,
     ):
-        """Stage 3 — after FCDAugmentations (SynthFCD path only)."""
+        """Stage 2 — after FCDAugmentations (SynthFCD path only)."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(aug_img.squeeze(),  out_dir, "stage3_after_fcd_aug.nii.gz",     dtype=np.float32)
-        self._save_nii(rroi_3d.squeeze(),  out_dir, "stage3_after_fcd_aug_roi.nii.gz", dtype=np.uint8)
-        self._log_stats(subject_id, f"stage3_after_fcd_aug (choices={choices})", aug_img)
-        print(f"[PipelineDebug] {subject_id} | Stage 3 (FCD aug: {choices}) saved → {out_dir}")
 
-    def save_stage4_after_intensity(self, subject_id: str, aug_image_item: torch.Tensor):
-        """Stage 4 — final aug_image_item after IntensityTransform, normalized to [0,1]."""
+        self._save_nii(aug_img.squeeze(), out_dir, "stage2_after_fcd_aug.nii.gz",     dtype=np.float32)
+        self._save_nii(rroi_3d.squeeze(), out_dir, "stage2_after_fcd_aug_roi.nii.gz", dtype=np.uint8)
+
+        self._log_stats(subject_id, f"stage2_after_fcd_aug (choices={choices})", aug_img)
+        print(f"[PipelineDebug] {subject_id} | Stage 2 (FCD aug: {choices}) saved → {out_dir}")
+
+    def save_stage3_after_intensity(self, subject_id: str, aug_image_item: torch.Tensor):
+        """Stage 3 — final aug_image_item after IntensityTransform, normalized to [0,1]."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(aug_image_item.squeeze(), out_dir, "stage4_after_intensity.nii.gz", dtype=np.float32)
-        self._log_stats(subject_id, "stage4_after_intensity", aug_image_item)
-        print(f"[PipelineDebug] {subject_id} | Stage 4 (intensity aug) saved → {out_dir}")
+        self._save_nii(aug_image_item.squeeze(), out_dir, "stage3_after_intensity.nii.gz", dtype=np.float32)
+        self._log_stats(subject_id, "stage3_after_intensity", aug_image_item)
+        print(f"[PipelineDebug] {subject_id} | Stage 3 (intensity aug) saved → {out_dir}")
 
-    def save_stage5_label_fusion(
+    def save_stage4_label_fusion(
         self,
         subject_id: str,
         slab_with_fcd: torch.Tensor,
         rlab_with_fcd: torch.Tensor,
     ):
-        """Stage 5 — after label fusion: ROI voxels stamped as class 6 (SynthFCD path only)."""
+        """Stage 4 — after label fusion: ROI voxels stamped as class 6 (SynthFCD path only)."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(slab_with_fcd.squeeze(), out_dir, "stage5_label_fused_slab.nii.gz", dtype=np.int16)
-        self._save_nii(rlab_with_fcd.squeeze(), out_dir, "stage5_label_fused_rlab.nii.gz", dtype=np.int16)
-        self._log_stats(subject_id, "stage5_slab_with_fcd", slab_with_fcd)
-        self._log_stats(subject_id, "stage5_rlab_with_fcd", rlab_with_fcd)
-        print(f"[PipelineDebug] {subject_id} | Stage 5 (label fusion) saved → {out_dir}")
-        
-    def save_stage6_after_intensity(self, subject_id: str, real_image_item: torch.Tensor):
-        """Stage 6 — final rimg after IntensityTransform, normalized to [0,1]."""
+
+        self._save_nii(slab_with_fcd.squeeze(), out_dir, "stage4_label_fused_slab.nii.gz", dtype=np.int16)
+        self._save_nii(rlab_with_fcd.squeeze(), out_dir, "stage4_label_fused_rlab.nii.gz", dtype=np.int16)
+
+        self._log_stats(subject_id, "stage4_slab_with_fcd", slab_with_fcd)
+        self._log_stats(subject_id, "stage4_rlab_with_fcd", rlab_with_fcd)
+
+        print(f"[PipelineDebug] {subject_id} | Stage 4 (label fusion) saved → {out_dir}")
+
+    def save_stage5_after_intensity(self, subject_id: str, real_image_item: torch.Tensor):
+        """Stage 5 — final rimg after IntensityTransform, normalized to [0,1]."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
-        self._save_nii(real_image_item.squeeze(), out_dir, "stage6_after_intensity.nii.gz", dtype=np.float32)
-        self._log_stats(subject_id, "stage6_after_intensity", real_image_item)
-        print(f"[PipelineDebug] {subject_id} | Stage 6 (intensity aug) saved → {out_dir}")
+        self._save_nii(real_image_item.squeeze(), out_dir, "stage5_after_intensity.nii.gz", dtype=np.float32)
+        self._log_stats(subject_id, "stage5_after_intensity", real_image_item)
+        print(f"[PipelineDebug] {subject_id} | Stage 5 (intensity aug) saved → {out_dir}")
 
     def mark_saved(self, subject_id: str):
         """Call after all stages are saved to prevent re-saving this subject."""
@@ -770,7 +774,7 @@ class SynthesisPipelineDebugger:
 
     def _subject_dir(self, subject_id: str, aug_type: str = "") -> str:
         folder = f"{subject_id}-{aug_type.replace('+', '-')}" if aug_type else subject_id
-        d = os.path.join(self.output_root, folder)
+        d      = os.path.join(self.output_root, folder)
         os.makedirs(d, exist_ok=True)
         return d
 
@@ -783,7 +787,7 @@ class SynthesisPipelineDebugger:
 
     def _log_stats(self, subject_id: str, stage_name: str, tensor: torch.Tensor):
         try:
-            t = tensor.detach().cpu().float()
+            t    = tensor.detach().cpu().float()
             line = (
                 f"[{stage_name}] "
                 f"shape={tuple(t.shape)}  "
@@ -847,7 +851,7 @@ class Model(pl.LightningModule):
         # Example CLI usage:
         #   --model.debug_subject_ids '["sub-00001", "sub-00027", "sub-00065"]'
         modality_tag = "flair" if flair_modality else "random"
-        synth_tag = "native" if native_synthesis else "synthFCD"
+        synth_tag    = "native" if native_synthesis else "synthFCD"
         self._pipeline_debugger = SynthesisPipelineDebugger(
             debug_subject_ids=set(debug_subject_ids or []),
             output_root=os.path.join(OUTPUT_FOLDER, f"pipeline_debug_{modality_tag}_{synth_tag}"),
@@ -863,11 +867,12 @@ class Model(pl.LightningModule):
 
         # ── Sub-modules ───────────────────────────────────────────────────────
         self.subject_params_cache   = self._load_subject_params()
-        seg_net                     = self._build_seg_network(ndim, nb_classes, seg_features,seg_activation, seg_nb_levels, seg_nb_conv, seg_norm)
+        seg_net                     = self._build_seg_network(ndim, nb_classes, seg_features, seg_activation, seg_nb_levels, seg_nb_conv, seg_norm)
         synth                       = self._build_synth(flair_modality)
         loss_fn                     = self._build_loss(loss)
         self.network                = SynthSeg(seg_net, synth, loss_fn)
         self.intensity_aug          = self._build_intensity_aug()
+        self.rimg_normalizer        = cc.QuantileTransform(clip=True)
         self.fcd_aug                = FCDAugmentations()
 
         # ── Metrics ───────────────────────────────────────────────────────────
@@ -906,7 +911,7 @@ class Model(pl.LightningModule):
         print(f"  modality        : {modality}")
 
         total_params = sum(p.numel() for p in seg.parameters())
-        trainable = sum(p.numel() for p in seg.parameters() if p.requires_grad)
+        trainable    = sum(p.numel() for p in seg.parameters() if p.requires_grad)
         print(f"  Total params    : {total_params:,}")
         print(f"  Trainable params: {trainable:,}")
 
@@ -973,8 +978,7 @@ class Model(pl.LightningModule):
             print(f'[Model] Warning: failed to parse CSV — {exc}')
         return cache
 
-    def _build_seg_network(self, ndim, nb_classes, features, activation,
-                           nb_levels, nb_conv, norm):
+    def _build_seg_network(self, ndim, nb_classes, features, activation, nb_levels, nb_conv, norm):
         backbone = UNet(ndim, nb_features=features, activation=activation,
                         nb_levels=nb_levels, nb_conv=nb_conv, norm=norm)
         return SegNet(ndim, 1, nb_classes, backbone=backbone, activation=None)
@@ -1030,7 +1034,7 @@ class Model(pl.LightningModule):
         if self.hparams.flair_modality:
             if self.hparams.native_synthesis:
                 params = dict(params)
-                if 21 not in params:   # only uses lesion_gmm_params as fallback if 21 not in CSV
+                if 21 not in params:  # only uses lesion_gmm_params as fallback if 21 not in CSV
                     params[21] = self.lesion_gmm_params
             self.network.synth.set_class_params(params)
 
@@ -1043,22 +1047,21 @@ class Model(pl.LightningModule):
         if aug_type == 'combo':
             return random.sample(['blur', 'zoom', 'hyper', 'trans'], random.randint(1, 4))
         return aug_type.split('+')
-     
-     
+
     def _apply_fcd_augmentations(
-        self,
-        img: torch.Tensor,
-        roi: torch.Tensor,
-        choices: list,
-        params: dict,
+            self,
+            img: torch.Tensor,
+            roi: torch.Tensor,
+            choices: list,
+            params: dict,
     ) -> tuple:
         """
         Apply the FCD augmentation chain with pre-sampled random parameters.
-     
+
         All random values are drawn here — once per subject, before any
         augmentation method is invoked — so every subject is guaranteed a
         statistically independent sample regardless of augmentation order.
-     
+
         Parameters
         ----------
         img     : (Z, Y, X) synthetic image tensor on GPU
@@ -1071,7 +1074,7 @@ class Model(pl.LightningModule):
                     'hyper_sigma' → sigma_range for hyper
                     'trans_sigma' → sigma_range for trans
                     'tail_length' → (min_int, max_int) for trans tail
-     
+
         Returns
         -------
         img : augmented image tensor
@@ -1087,22 +1090,21 @@ class Model(pl.LightningModule):
             'trans_intensity':  random.uniform(*params['int_rng']),
             'trans_sigma':      random.uniform(*params['trans_sigma']),
         }
-     
+
         # ── Apply augmentations using the pre-sampled values ─────────────────────
         for ch in choices:
             if ch == 'zoom':
-                print(f"[DEBUG] zoom_factor={pre['zoom_factor']:.4f}, shape={img.shape}")
                 img, roi = self.fcd_aug.apply_roi_thickening(
                     img, roi,
                     zoom_factor=pre['zoom_factor'],
                 )
-            
+
             elif ch == 'blur':
                 img = self.fcd_aug.apply_roi_augmentations_blured(
                     img, roi,
                     sigma=pre['blur_sigma'],
                 )
-     
+
             elif ch in ('hyper', 'trans'):
                 img = self.fcd_aug.apply_roi_augmentations_hyperintensity(
                     img, roi,
@@ -1116,7 +1118,7 @@ class Model(pl.LightningModule):
                       f"| params={pre}")
                 # Return the pre-augmentation image to avoid propagating NaN
                 return img, roi
-         
+
         return img, roi
 
     def _process_single_sample(self, batch: dict, i: int):
@@ -1125,6 +1127,18 @@ class Model(pl.LightningModule):
         native_synthesis=False : SharedSynth → FCD aug → IntensityTransform → label fusion
         native_synthesis=True  : SharedSynth (fusedmask) → IntensityTransform  (no aug, no fusion)
         Returns (aug_image, aug_mask, real_image, real_mask) or None if skipped.
+
+        simg normalization
+        ──────────────────
+        simg exits SharedSynth already in [0, 1] regardless of path:
+        - flair_modality=True  : QuantileTransform(clip=True) applied inside
+                                 SynthFromLabelTransform after GMM (no_augs=True path)
+        - flair_modality=False : cc.IntensityTransform ends with QuantileTransform
+
+        rimg normalization
+        ──────────────────
+        rimg is the real FLAIR from disk (~0–245). Normalized here via
+        QuantileTransform(clip=True) before IntensityTransform, matching simg's scale.
 
         Debug instrumentation
         ─────────────────────
@@ -1137,7 +1151,7 @@ class Model(pl.LightningModule):
         roi_t      = batch['roi_t'][i]
         aug_type   = batch['aug_type'][i]
         subject_id = batch.get('subject_id', [None] * len(batch['label_t']))[i]
-        
+
         # Validate the actual synthesis input — fusedmask on native path, labelmap otherwise
         input_t = batch['fusedmask_t'][i] if self.hparams.native_synthesis else label_t
         if input_t.sum() == 0 or torch.isnan(input_t.float()).any():
@@ -1172,38 +1186,33 @@ class Model(pl.LightningModule):
                     subject_id, simg, slab_out, rimg, rlab_out, rroi=None
                 )
 
+            # simg exits SharedSynth already in [0,1] — no manual normalization needed
             simg_3d = simg.squeeze(0).float()
-
-            if self.hparams.flair_modality:
-                simg_3d = torch.clamp(simg_3d / 218.0, 0.0, 1.0)
-                # ── Debug: Stage 2 — after /255 clamp ─────────────────────────────
-                if is_debug:
-                    dbg.save_stage2_after_clamp(subject_id, simg_3d)
 
             aug_out = self.intensity_aug(simg_3d.unsqueeze(0))
             aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
-            # ── Guard: catch NaN/inf introduced by IntensityTransform ─────────────────
+
+            # ── Guard: catch NaN/inf introduced by IntensityTransform ─────────────
             if not torch.isfinite(aug_image_item).all():
                 bad = (~torch.isfinite(aug_image_item)).sum().item()
-                print(f"[WARN] Stage 4 (IntensityTransform) produced {bad} non-finite voxels "
-                      f"for subject={subject_id}, aug={choices} — skipping sample")
-                return None   # synthesize_batch already handles None by skipping
+                print(f"[WARN] Stage 3 (IntensityTransform) produced {bad} non-finite voxels "
+                      f"for subject={subject_id} — skipping sample")
+                return None
 
-
-            # ── Debug: Stage 4 — after IntensityTransform ─────────────────────────
+            # ── Debug: Stage 3 — after IntensityTransform ─────────────────────────
             if is_debug:
-                dbg.save_stage4_after_intensity(subject_id, aug_image_item)
+                dbg.save_stage3_after_intensity(subject_id, aug_image_item)
                 dbg.mark_saved(subject_id)
 
             # slab_out and rlab_out already have class 6 from remap_labels — no label fusion needed
             rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
-            rimg_norm = torch.clamp(rimg_norm / 218.0, 0.0, 1.0)
+            rimg_norm = self.rimg_normalizer.make_final(rimg_norm)(rimg_norm)
             rimg_out = self.intensity_aug(rimg_norm)
             rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
 
-            # ── Debug: Stage 6 — rimg after normalization + IntensityTransform ──────
+            # ── Debug: Stage 5 — rimg after normalization + IntensityTransform ──────
             if is_debug:
-                dbg.save_stage6_after_intensity(subject_id, rimg_norm) 
+                dbg.save_stage5_after_intensity(subject_id, rimg_norm)
                 dbg.mark_saved(subject_id)
 
             return (
@@ -1212,7 +1221,7 @@ class Model(pl.LightningModule):
                 rimg_norm,
                 rlab_out.long(),
             )
-            
+
         # ── Augmented synthesis path (original) ───────────────────────────────────
         aug_params = {
             'int_rng':     (batch['int_factor_min'][i].item(),  batch['int_factor_max'][i].item()),
@@ -1231,18 +1240,12 @@ class Model(pl.LightningModule):
         if is_debug:
             dbg.save_stage1_after_synth(subject_id, simg, slab, rimg, rlab, rroi)
 
-        if self.hparams.flair_modality:
-            simg_3d = torch.clamp(simg_3d / 218.0, 0.0, 1.0)
-            # ── Debug: Stage 2 — after /255 clamp ─────────────────────────────────
-            if is_debug:
-                dbg.save_stage2_after_clamp(subject_id, simg_3d)
-
         choices = self._parse_aug_choices(aug_type)
         aug_img, rroi_3d = self._apply_fcd_augmentations(simg_3d.clone(), rroi_3d, choices, aug_params)
 
-        # ── Debug: Stage 3 — after FCDAugmentations ───────────────────────────────
+        # ── Debug: Stage 2 — after FCDAugmentations ───────────────────────────────
         if is_debug:
-            dbg.save_stage3_after_fcd_aug(subject_id, aug_img, rroi_3d, choices)
+            dbg.save_stage2_after_fcd_aug(subject_id, aug_img, rroi_3d, choices)
 
         aug_out = self.intensity_aug(aug_img.float().unsqueeze(0))
         aug_image_item = aug_out[0] if isinstance(aug_out, (list, tuple)) else aug_out
@@ -1250,13 +1253,13 @@ class Model(pl.LightningModule):
         # ── Guard: catch NaN/inf introduced by IntensityTransform ─────────────────
         if not torch.isfinite(aug_image_item).all():
             bad = (~torch.isfinite(aug_image_item)).sum().item()
-            print(f"[WARN] Stage 4 (IntensityTransform) produced {bad} non-finite voxels "
+            print(f"[WARN] Stage 3 (IntensityTransform) produced {bad} non-finite voxels "
                   f"for subject={subject_id}, aug={choices} — skipping sample")
             return None
 
-        # ── Debug: Stage 4 — after IntensityTransform ─────────────────────────────
+        # ── Debug: Stage 3 — after IntensityTransform ─────────────────────────────
         if is_debug:
-            dbg.save_stage4_after_intensity(subject_id, aug_image_item)
+            dbg.save_stage3_after_intensity(subject_id, aug_image_item)
 
         slab_with_fcd = slab_3d.clone()
         slab_with_fcd[rroi_3d > 0] = 6
@@ -1264,21 +1267,21 @@ class Model(pl.LightningModule):
         rlab_with_fcd = rlab.long().squeeze(0).clone()
         rlab_with_fcd[rroi_3d > 0] = 6
 
-        # ── Debug: Stage 5 — after label fusion ───────────────────────────────────
+        # ── Debug: Stage 4 — after label fusion ───────────────────────────────────
         if is_debug:
-            dbg.save_stage5_label_fusion(
+            dbg.save_stage4_label_fusion(
                 subject_id, slab_with_fcd.unsqueeze(0), rlab_with_fcd.unsqueeze(0)
             )
             dbg.mark_saved(subject_id)
-    
+
         rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
-        rimg_norm = torch.clamp(rimg_norm / 218.0, 0.0, 1.0)
+        rimg_norm = self.rimg_normalizer.make_final(rimg_norm)(rimg_norm)
         rimg_out = self.intensity_aug(rimg_norm)
         rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
 
-        # ── Debug: Stage 6 — rimg after normalization + IntensityTransform ──────────
+        # ── Debug: Stage 5 — rimg after normalization + IntensityTransform ──────────
         if is_debug:
-            dbg.save_stage6_after_intensity(subject_id, rimg_norm)  
+            dbg.save_stage5_after_intensity(subject_id, rimg_norm)
 
         return (
             aug_image_item,
@@ -1286,7 +1289,7 @@ class Model(pl.LightningModule):
             rimg_norm,
             rlab_with_fcd.unsqueeze(0),
         )
-    
+
     def synthesize_batch(self, batch: dict):
         """Run the synthesis pipeline for every sample. Returns stacked tensors."""
         results     = []
@@ -1359,7 +1362,7 @@ class Model(pl.LightningModule):
             'real_image':    real_image.cpu(),
             'aug_mask':      aug_mask.cpu(),
             'target_labels': target_labels,
-            'score':         -loss.item(),   # lower loss = higher score
+            'score':         -loss.item(),  # lower loss = higher score
             'batch_idx':     batch_idx,
         })
         self._val_batch_cache.sort(key=lambda x: x['score'], reverse=True)
@@ -1367,15 +1370,14 @@ class Model(pl.LightningModule):
 
         return loss
 
-    def _log_val_diagnostics(self, pred_synth, pred_labels, aug_image,
-                             real_image, aug_mask, real_labels, suffix=''):
+    def _log_val_diagnostics(self, pred_synth, pred_labels, aug_image, real_image, aug_mask, real_labels, suffix=''):
         """Log class-count scalars and save NIfTI samples every 20 epochs."""
         pred_synth_argmax = pred_synth[0].argmax(dim=0)
         pred_real_argmax  = pred_labels[0]
         self.log('pred_synth_num_classes',
                  float(len(torch.unique(pred_synth_argmax))), prog_bar=False)
         self.log('pred_real_num_classes',
-                 float(len(torch.unique(pred_real_argmax))),  prog_bar=False)
+                 float(len(torch.unique(pred_real_argmax))), prog_bar=False)
 
         if self.trainer.current_epoch % 20 != 0:
             return
@@ -1387,12 +1389,12 @@ class Model(pl.LightningModule):
               f' {suffix} → {img_root}')
 
         p = f'{img_root}/epoch-{self.trainer.current_epoch:04d}'
-        save(pred_synth_argmax,                  f'{p}_{suffix}_synth-pred.nii.gz')
-        save(pred_real_argmax,                   f'{p}_{suffix}_real-pred.nii.gz')
-        save(aug_image[0].squeeze(0),            f'{p}_{suffix}_synth-image.nii.gz')
-        save(real_image[0].squeeze(0),           f'{p}_{suffix}_real-image.nii.gz')
+        save(pred_synth_argmax,                       f'{p}_{suffix}_synth-pred.nii.gz')
+        save(pred_real_argmax,                        f'{p}_{suffix}_real-pred.nii.gz')
+        save(aug_image[0].squeeze(0),                 f'{p}_{suffix}_synth-image.nii.gz')
+        save(real_image[0].squeeze(0),                f'{p}_{suffix}_real-image.nii.gz')
         save(aug_mask[0].squeeze(0).to(torch.uint8),  f'{p}_{suffix}_synth-ref.nii.gz')
-        save(real_labels[0].to(torch.uint8),     f'{p}_{suffix}_real-ref.nii.gz')
+        save(real_labels[0].to(torch.uint8),          f'{p}_{suffix}_real-ref.nii.gz')
 
     def on_validation_epoch_end(self):
         # Save NIfTI diagnostics for the best N cached batches
@@ -1408,15 +1410,15 @@ class Model(pl.LightningModule):
             )
         self._val_batch_cache = []
 
-        dice_epoch = self.val_dice.compute()
+        dice_epoch   = self.val_dice.compute()
         dice_per_cls = self.val_dice_fcd.compute()
-        dice_fcd = dice_per_cls[5] if len(dice_per_cls) > 5 else torch.tensor(0.0)
+        dice_fcd     = dice_per_cls[5] if len(dice_per_cls) > 5 else torch.tensor(0.0)
 
         self.log('val_dice',     dice_epoch, prog_bar=True)
         self.log('val_dice_fcd', dice_fcd,   prog_bar=False)
 
         tl = self.trainer.callback_metrics.get('train_loss', -1)
-        el = self.trainer.callback_metrics.get('eval_loss',  -1)
+        el = self.trainer.callback_metrics.get('eval_loss', -1)
         print(f"\n{'=' * 40}")
         print(f"EPOCH {self.trainer.current_epoch} SUMMARY:")
         print(f"  Train Loss    : {float(tl):.4f}")
@@ -1432,13 +1434,12 @@ class Model(pl.LightningModule):
         self.val_dice.reset()
         self.val_dice_fcd.reset()
 
-
     # ══════════════════════════════════════════════════════════════════════════
     #  Optimiser / callbacks / inference
     # ══════════════════════════════════════════════════════════════════════════
 
     def configure_optimizers(self):
-        opt_cls = getattr(optim, self.optimizer_name)
+        opt_cls   = getattr(optim, self.optimizer_name)
         optimizer = opt_cls(self.network.segnet.parameters(),
                             **(self.optimizer_options or {}))
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -1462,7 +1463,6 @@ class Model(pl.LightningModule):
 
 
 # ── Helper Functions ──────────────────────────────────────────────────────────
-
 def save(dat, fname):
     dat = dat.detach().cpu().numpy()
     h = nib.Nifti1Header()
@@ -1802,7 +1802,6 @@ class CheckpointTraceCallback(Callback):
 
 
 # ── CLI & Main ────────────────────────────────────────────────────────────────
-
 class CLI(LightningCLI):
     def add_arguments_to_parser(self, parser):
         parser.add_lightning_class_args(ModelCheckpoint, "checkpoint")
