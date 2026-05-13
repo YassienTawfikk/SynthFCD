@@ -669,10 +669,8 @@ class DiceCELoss(Loss):
         # Initialize sub-losses.
         # We pass activation=None because the activation is handled
         # in the forward pass of this wrapper class to ensure consistency.
-        self.dice = DiceLoss(square=square, weighted=weighted, labels=labels,
-                             eps=eps, reduction=reduction, activation=None)
-        self.ce = CatLoss(weighted=weighted, labels=labels,
-                          reduction=reduction, activation=None)
+        self.dice   = DiceLoss(square=square, weighted=weighted, labels=labels, eps=eps, reduction=reduction, activation=None)
+        self.ce     = CatLoss(                weighted=weighted, labels=labels,          reduction=reduction, activation=None)
 
     def forward(self, pred, ref, mask=None):
         """
