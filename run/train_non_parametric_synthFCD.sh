@@ -20,6 +20,7 @@ python ../scripts/train_non_parametric_synthFCD.py fit \
   --data.batch_size 2 \
   --data.num_workers 4 \
   --data.eval 0.2 \
+  --data.split_seed 42 \
   --data.use_extra_data true \
   \
   --model.native_synthesis false \
