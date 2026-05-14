@@ -232,6 +232,7 @@ class FCDDataModule(pl.LightningDataModule):
                  dataset_path: str             = DEFAULT_FOLDER,
                  eval: float                   = 0.04,
                  preshuffle: bool              = False,
+                 split_seed: int               = 42,
                  batch_size: int               = 1,
                  shuffle: bool                 = True,
                  num_workers: int              = 4,
@@ -247,6 +248,7 @@ class FCDDataModule(pl.LightningDataModule):
         self.dataset_path     = dataset_path
         self.eval_frac        = eval
         self.preshuffle       = preshuffle
+        self.split_seed       = split_seed
         self.batch_size       = batch_size
         self.shuffle          = shuffle
         self.num_workers      = num_workers
@@ -363,6 +365,11 @@ class FCDDataModule(pl.LightningDataModule):
         if self.preshuffle:
             combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths))
             shuffle(combined)
+            raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
+        else:
+            # seeded deterministic shuffle before split
+            combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths))
+            random.Random(self.split_seed).shuffle(combined)
             raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
 
         def _count(param, total):
