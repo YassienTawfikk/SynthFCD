@@ -970,8 +970,12 @@ class Model(pl.LightningModule):
             print(f"  Subjects to debug      : {sorted(dbg.debug_subject_ids)}")
             print(f"  Output root            : {dbg.output_root}")
             print(f"  Save once per subject  : {dbg.save_once}")
-            print(f"  Stages saved           : 0=inputs, 1=synth, 2=clamp(flair), "
-                  f"3=fcd_aug(non-native), 4=intensity, 5=label_fusion(non-native)")
+            if self.hparams.native_synthesis:
+                print(f"  Stages saved           : 0=inputs, 1=synth, "
+                      f"3=intensity, 5=rimg_intensity")
+            else:
+                print(f"  Stages saved           : 0=inputs, 1=synth, "
+                      f"2=fcd_aug, 3=intensity, 4=label_fusion, 5=rimg_intensity")
         else:
             print(f"\n  Pipeline Debugger      : DISABLED (no debug_subject_ids set)")
 
