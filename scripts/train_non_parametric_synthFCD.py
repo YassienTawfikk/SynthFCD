@@ -9,10 +9,21 @@ import random
 import shutil
 import datetime
 import traceback
+import warnings
 
 from typing import Sequence, Optional
 from os     import path, makedirs
 from random import shuffle
+
+# ── Warning suppression (before Lightning/torch imports) ────────────────────
+warnings.filterwarnings("ignore", message=".*weights_only.*")
+warnings.filterwarnings("ignore", message=".*DiceScore metric currently defaults.*")
+warnings.filterwarnings("ignore", message=".*batch_size.*ambiguous collection.*")
+warnings.filterwarnings("ignore", message=".*lr scheduler dict contains.*")
+warnings.filterwarnings("ignore", message=".*Precision 16-mixed is not supported.*")
+warnings.filterwarnings("ignore", message=".*Checkpoint directory.*exists and is not empty.*")
+warnings.filterwarnings("ignore", message=".*Experiment logs directory.*exists and is not empty.*")
+warnings.filterwarnings("ignore", message=".*isinstance.*LeafSpec.*deprecated.*")
 
 # ── Third-party libraries ───────────────────────────────────────────────────
 import numpy             as np
@@ -20,6 +31,13 @@ import pandas            as pd
 import torch
 import matplotlib.pyplot as plt
 import nibabel           as nib
+
+# ── torch.load patch (suppress weights_only FutureWarning) ──────────────────
+_original_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    kwargs.setdefault('weights_only', False)
+    return _original_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
 
 import pytorch_lightning         as pl
 from pytorch_lightning.cli       import LightningCLI
@@ -73,25 +91,6 @@ from learn2synth.configurations import (
     BLUR_SUBJECTS,
     THICKENING_SUBJECTS,
 )
-
-# Patch torch.load to suppress the weights_only FutureWarning
-_original_torch_load = torch.load
-def _patched_torch_load(*args, **kwargs):
-    kwargs.setdefault('weights_only', False)
-    return _original_torch_load(*args, **kwargs)
-torch.load = _patched_torch_load
-
-import warnings
-warnings.filterwarnings("ignore", message=".*weights_only.*")
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", message=".*DiceScore metric currently defaults.*")
-warnings.filterwarnings("ignore", message=".*batch_size.*ambiguous collection.*")
-warnings.filterwarnings("ignore", message=".*lr scheduler dict contains.*")
-warnings.filterwarnings("ignore", message=".*Precision 16-mixed is not supported.*")
-warnings.filterwarnings("ignore", message=".*Checkpoint directory.*exists and is not empty.*")
-warnings.filterwarnings("ignore", message=".*Experiment logs directory.*exists and is not empty.*")
-warnings.filterwarnings("ignore", message=".*isinstance.*LeafSpec.*deprecated.*")
-
 
 # ── FCDDataset ────────────────────────────────────────────────────────────────
 # Returns un-augmented volumes plus random augmentation configurations.
