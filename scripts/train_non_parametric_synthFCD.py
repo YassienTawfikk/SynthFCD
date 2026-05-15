@@ -1336,7 +1336,7 @@ class Model(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         # Periodically free CUDA cache to prevent fragmentation over long runs
-        if self.trainer.current_epoch % 10 == 0 and batch_idx == 0:
+        if self.trainer.current_epoch % 2 == 0 and batch_idx == 0:
             torch.cuda.empty_cache()
 
         result = self.synthesize_batch(batch)
