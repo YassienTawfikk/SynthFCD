@@ -81,6 +81,7 @@ warnings.filterwarnings("ignore", message=".*lr scheduler dict contains.*")
 warnings.filterwarnings("ignore", message=".*Precision 16-mixed is not supported.*")
 warnings.filterwarnings("ignore", message=".*Checkpoint directory.*exists and is not empty.*")
 warnings.filterwarnings("ignore", message=".*Experiment logs directory.*exists and is not empty.*")
+warnings.filterwarnings("ignore", message=".*isinstance.*LeafSpec.*deprecated.*")
 
 
 # ── FCDDataset ────────────────────────────────────────────────────────────────
