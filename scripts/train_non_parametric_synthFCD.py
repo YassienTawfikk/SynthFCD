@@ -16,6 +16,8 @@ from os     import path, makedirs
 from random import shuffle
 
 # ── Warning suppression (before Lightning/torch imports) ────────────────────
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="mistune")
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="nbconvert")
 warnings.filterwarnings("ignore", message=".*DiceScore metric currently defaults.*")
 warnings.filterwarnings("ignore", message=".*batch_size.*ambiguous collection.*")
 warnings.filterwarnings("ignore", message=".*lr scheduler dict contains.*")
