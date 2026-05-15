@@ -1847,8 +1847,6 @@ class LossGraphCallback(Callback):
             finally:
                 plt.close()
 
-            print(f"[LossGraph] Updated plot → {plot_path}")
-
         except Exception as e:
             print(f"[LossGraph] ❌ Error at epoch {trainer.current_epoch}: "
                   f"{type(e).__name__}: {e}")
