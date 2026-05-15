@@ -38,8 +38,11 @@ python ../scripts/train_non_parametric_synthFCD.py fit \
   --trainer.precision 16-mixed \
   --trainer.enable_progress_bar false \
   --trainer.log_every_n_steps 5 \
+  --trainer.num_sanity_val_steps 0 \
   \
   --checkpoint.save_top_k 1 \
   --checkpoint.monitor eval_loss \
   --checkpoint.mode min \
-  --checkpoint.save_last true
+  --checkpoint.save_last true \
+  \
+  --seed_everything 0
