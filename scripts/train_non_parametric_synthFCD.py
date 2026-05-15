@@ -16,8 +16,6 @@ from os     import path, makedirs
 from random import shuffle
 
 # ── Warning suppression (before Lightning/torch imports) ────────────────────
-os.environ["PYTHONWARNINGS"] = "ignore:.*weights_only.*:FutureWarning"
-warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only.*")
 warnings.filterwarnings("ignore", message=".*DiceScore metric currently defaults.*")
 warnings.filterwarnings("ignore", message=".*batch_size.*ambiguous collection.*")
 warnings.filterwarnings("ignore", message=".*lr scheduler dict contains.*")
@@ -32,13 +30,6 @@ import pandas            as pd
 import torch
 import matplotlib.pyplot as plt
 import nibabel           as nib
-
-# ── torch.load patch (suppress weights_only FutureWarning) ──────────────────
-_original_torch_load = torch.load
-def _patched_torch_load(*args, **kwargs):
-    kwargs.setdefault('weights_only', False)
-    return _original_torch_load(*args, **kwargs)
-torch.load = _patched_torch_load
 
 import pytorch_lightning         as pl
 from pytorch_lightning.cli       import LightningCLI
