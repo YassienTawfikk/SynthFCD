@@ -356,23 +356,29 @@ class FCDDataModule(pl.LightningDataModule):
             return
         self._setup_done = True
 
-        # Copy raw pool (and shuffle if requested) before splitting
+        # Copy raw pool before splitting
         raw_label_paths = list(self._raw_label_paths)
         raw_flair_paths = list(self._raw_flair_paths)
-        raw_roi_paths   = list(self._raw_roi_paths)
+        raw_roi_paths = list(self._raw_roi_paths)
         raw_fused_paths = list(self._raw_fused_paths)
 
-        if self.preshuffle:
+        # Shuffle raw pool before splitting — seeded (preshuffle=False) or unseeded (preshuffle=True)
+        # fused_paths excluded from zip when native_synthesis=False (empty list crashes zip)
+        if self.native_synthesis:
             combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths))
-            if combined:
-                shuffle(combined)
-                raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
         else:
-            # seeded deterministic shuffle before split
-            combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths))
-            if combined:
+            combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths))
+
+        if combined:
+            if self.preshuffle:
+                shuffle(combined)
+            else:
                 random.Random(self.split_seed).shuffle(combined)
+
+            if self.native_synthesis:
                 raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
+            else:
+                raw_label_paths, raw_flair_paths, raw_roi_paths = map(list, zip(*combined))
 
         def _count(param, total):
             if isinstance(param, float): return int(math.ceil(total * param))
@@ -385,18 +391,18 @@ class FCDDataModule(pl.LightningDataModule):
         val_label_paths = raw_label_paths[:n_val]
         val_flair_paths = raw_flair_paths[:n_val]
         val_roi_paths   = raw_roi_paths[:n_val]
-        val_fused_paths = raw_fused_paths[:n_val]  # ← fixed
+        val_fused_paths = raw_fused_paths[:n_val]
 
         train_raw_label_paths = raw_label_paths[n_val:]
         train_raw_flair_paths = raw_flair_paths[n_val:]
         train_raw_roi_paths   = raw_roi_paths[n_val:]
-        train_raw_fused_paths = raw_fused_paths[n_val:]  # ← fixed
+        train_raw_fused_paths = raw_fused_paths[n_val:]
 
         # Training set = remaining raw + all extra
         train_label_paths = train_raw_label_paths + list(self._extra_label_paths)
         train_flair_paths = train_raw_flair_paths + list(self._extra_flair_paths)
         train_roi_paths   = train_raw_roi_paths   + list(self._extra_roi_paths)
-        train_fused_paths = train_raw_fused_paths + list(self._extra_fused_paths)  # ← fixed
+        train_fused_paths = train_raw_fused_paths + list(self._extra_fused_paths)
 
         print(
             f"[FCDDataModule] Split: "
