@@ -1527,17 +1527,17 @@ class Model(pl.LightningModule):
 
         tl = self.trainer.callback_metrics.get('train_loss', -1)
         el = self.trainer.callback_metrics.get('eval_loss', -1)
+        # Log current LR from the scheduler Lightning manages
+        current_lr = self.optimizers().param_groups[0]['lr']
+
         print(f"\n{'=' * 40}")
         print(f"EPOCH {self.trainer.current_epoch} SUMMARY:")
         print(f"  Train Loss    : {float(tl):.4f}")
         print(f"  Eval Loss     : {float(el):.4f}")
         print(f"  DICE SCORE    : {dice_epoch:.4f}")
         print(f"  DICE FCD (c6) : {dice_fcd:.4f}")
+        print(f"  LR            : {current_lr:.2e}")
         print(f"{'=' * 40}\n")
-
-        # Log current LR from the scheduler Lightning manages
-        current_lr = self.optimizers().param_groups[0]['lr']
-        print(f'  LR            : {current_lr:.2e}')
 
         self.val_dice.reset()
         self.val_dice_fcd.reset()
@@ -1879,14 +1879,13 @@ class CLI(LightningCLI):
     def add_arguments_to_parser(self, parser):
         parser.add_lightning_class_args(ModelCheckpoint, "checkpoint")
         parser.set_defaults({
-            "checkpoint.monitor": "eval_loss",
-            "checkpoint.save_last": True,
-            "checkpoint.save_top_k": 1,
-            "checkpoint.filename": "checkpoint-{epoch:02d}-{eval_loss:.2f}-{val_dice:.2f}",
+            "checkpoint.monitor":        "eval_loss",
+            "checkpoint.save_last":      True,
+            "checkpoint.save_top_k":     1,
+            "checkpoint.filename":       "checkpoint-{epoch:02d}-{eval_loss:.2f}-{val_dice:.2f}",
             "checkpoint.every_n_epochs": 1,
         })
-        parser.link_arguments("model.native_synthesis", "data.native_synthesis")  # ← add
-
+        parser.link_arguments("model.native_synthesis", "data.native_synthesis")
 
     def instantiate_trainer(self, **kwargs):
         run_name = os.environ.get(
@@ -1894,7 +1893,8 @@ class CLI(LightningCLI):
             f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}",
         )
         default_root = kwargs.get("default_root_dir", "experiments")
-        save_dir = os.path.join(default_root, run_name)
+        save_dir     = os.path.join(default_root, run_name)
+        ckpt_dir     = os.path.join(save_dir, "checkpoints")
         makedirs(save_dir, exist_ok=True)
 
         print(f"[System] Initializing Run: {run_name}")
@@ -1913,17 +1913,34 @@ class CLI(LightningCLI):
         cbs.append(LossGraphCallback())
         cbs.append(CheckpointTraceCallback())
 
+        # ── Additional checkpoints ────────────────────────────────────────────
+        cbs.append(ModelCheckpoint(
+            dirpath        = ckpt_dir,
+            monitor        = "val_dice",
+            mode           = "max",
+            save_top_k     = 1,
+            every_n_epochs = 1,
+            filename       = "best-dice-{epoch:02d}-{val_dice:.2f}",
+        ))
+        cbs.append(ModelCheckpoint(
+            dirpath        = ckpt_dir,
+            monitor        = "val_dice_fcd",
+            mode           = "max",
+            save_top_k     = 1,
+            every_n_epochs = 1,
+            filename       = "best-dice-fcd-{epoch:02d}-{val_dice_fcd:.2f}",
+        ))
+
         print("\n[CLI] Registered callbacks:")
         for i, cb in enumerate(cbs):
             print(f"  [{i}] {type(cb).__name__}")
         print()
 
-        kwargs["default_root_dir"] = save_dir
-        kwargs["enable_progress_bar"] = False
-        kwargs["logger"] = logger
-        kwargs["callbacks"] = cbs
+        kwargs["default_root_dir"]      = save_dir
+        kwargs["enable_progress_bar"]   = False
+        kwargs["logger"]                = logger
+        kwargs["callbacks"]             = cbs
         return super().instantiate_trainer(**kwargs)
-
 
 if __name__ == '__main__':
     cli = CLI(Model, FCDDataModule, save_config_kwargs={"overwrite": True})
