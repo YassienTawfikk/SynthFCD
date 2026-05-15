@@ -6,7 +6,6 @@ import sys
 import glob
 import math
 import random
-import shutil
 import datetime
 import traceback
 import warnings
@@ -17,7 +16,8 @@ from os     import path, makedirs
 from random import shuffle
 
 # ── Warning suppression (before Lightning/torch imports) ────────────────────
-warnings.filterwarnings("ignore", message=".*weights_only.*")
+os.environ["PYTHONWARNINGS"] = "ignore:.*weights_only.*:FutureWarning"
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only.*")
 warnings.filterwarnings("ignore", message=".*DiceScore metric currently defaults.*")
 warnings.filterwarnings("ignore", message=".*batch_size.*ambiguous collection.*")
 warnings.filterwarnings("ignore", message=".*lr scheduler dict contains.*")
