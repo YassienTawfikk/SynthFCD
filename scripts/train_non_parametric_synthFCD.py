@@ -1907,6 +1907,7 @@ class CheckpointTraceCallback(Callback):
         print(f"\n[CKPT TRACE] ❌ EXCEPTION: {type(exception).__name__}: {exception}")
         traceback.print_exc()
 
+
 # ── CLI & Main ────────────────────────────────────────────────────────────────
 class CLI(LightningCLI):
     def add_arguments_to_parser(self, parser):
@@ -1974,6 +1975,7 @@ class CLI(LightningCLI):
         kwargs["logger"]                = logger
         kwargs["callbacks"]             = cbs
         return super().instantiate_trainer(**kwargs)
+
 
 if __name__ == '__main__':
     cli = CLI(Model, FCDDataModule, save_config_kwargs={"overwrite": True})
