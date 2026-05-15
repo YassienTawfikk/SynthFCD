@@ -16,8 +16,6 @@ from os     import path, makedirs
 from random import shuffle
 
 # ── Warning suppression (before Lightning/torch imports) ────────────────────
-os.environ["PYTHONWARNINGS"] = "ignore:.*weights_only.*:FutureWarning"
-warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only.*")
 warnings.filterwarnings("ignore", message=".*DiceScore metric currently defaults.*")
 warnings.filterwarnings("ignore", message=".*batch_size.*ambiguous collection.*")
 warnings.filterwarnings("ignore", message=".*lr scheduler dict contains.*")
@@ -32,13 +30,6 @@ import pandas            as pd
 import torch
 import matplotlib.pyplot as plt
 import nibabel           as nib
-
-# ── torch.load patch (suppress weights_only FutureWarning) ──────────────────
-_original_torch_load = torch.load
-def _patched_torch_load(*args, **kwargs):
-    kwargs.setdefault('weights_only', False)
-    return _original_torch_load(*args, **kwargs)
-torch.load = _patched_torch_load
 
 import pytorch_lightning         as pl
 from pytorch_lightning.cli       import LightningCLI
@@ -1401,53 +1392,62 @@ class Model(pl.LightningModule):
             loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
                 aug_image, aug_mask, real_image, real_mask)
 
-        pred_labels   = pred_real.cpu().argmax(dim=1)
+        pred_labels = pred_real.cpu().argmax(dim=1)
         target_labels = real_mask.cpu().squeeze(1).long()
 
         self.val_dice.update(pred_labels, target_labels)
         self.val_dice_fcd.update(pred_labels, target_labels)
 
-        loss              = loss_synth + self.alpha * loss_real
+        loss = loss_synth + self.alpha * loss_real
         actual_batch_size = aug_image.shape[0]
         self.log('eval_loss', loss, prog_bar=True, batch_size=actual_batch_size)
 
-        # ── Per-subject metrics (every 10 epochs) ─────────────────────────────────
-        # Iterates over subjects in the batch individually so each gets its own
-        # Dice and loss logged under val_dice_<subject_id> / val_loss_<subject_id>.
-        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0:
-            _m = dict(include_background=False, num_classes=self.hparams.nb_classes,
-                      input_format='index')
-            for j, subj_id in enumerate(subject_ids):
-                if subj_id is None:
-                    continue
+        # ── Per-subject metrics ────────────────────────────────────────────────────
+        # Computes Dice + FCD Dice per subject for cache and optional logging.
+        # Logging only fires every val_diagnostics_interval epochs.
+        _m = dict(include_background=False, num_classes=self.hparams.nb_classes,
+                  input_format='index')
+        subj_metrics = []
+        for j, subj_id in enumerate(subject_ids):
+            if subj_id is None:
+                continue
 
-                subj_pred_labels = pred_labels[j:j+1]
-                subj_target      = target_labels[j:j+1]
-                subj_pred_logits = pred_real[j:j+1]
-                subj_mask        = real_mask[j:j+1]
+            subj_pred_labels = pred_labels[j:j + 1]
+            subj_target = target_labels[j:j + 1]
+            subj_pred_logits = pred_real[j:j + 1]
+            subj_mask = real_mask[j:j + 1]
 
-                # Dice — fresh metric instance to avoid state bleed between subjects
-                _dice = dice_compute(average='micro', **_m)
-                _dice.update(subj_pred_labels, subj_target)
-                subj_dice = _dice.compute()
+            # Dice — fresh metric instance to avoid state bleed between subjects
+            _dice = dice_compute(average='micro', **_m)
+            _dice.update(subj_pred_labels, subj_target)
+            subj_dice = _dice.compute().item()
 
-                # Loss
+            # FCD Dice (class 6 = index 5)
+            _dice_fcd = dice_compute(average='none', **_m)
+            _dice_fcd.update(subj_pred_labels, subj_target)
+            subj_dice_per_cls = _dice_fcd.compute()
+            subj_fcd = subj_dice_per_cls[5].item() if len(subj_dice_per_cls) > 5 else 0.0
+
+            subj_metrics.append({'id': subj_id, 'dice': subj_dice, 'fcd': subj_fcd})
+
+            # ── Log every val_diagnostics_interval epochs ──────────────────────────
+            if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0:
                 subj_loss = self.network.loss(subj_pred_logits, subj_mask)
-
-                self.log(f'val_dice_{subj_id}', subj_dice,        prog_bar=False)
+                self.log(f'val_dice_{subj_id}', subj_dice, prog_bar=False)
                 self.log(f'val_loss_{subj_id}', subj_loss.item(), prog_bar=False)
 
         # ── Cache for NIfTI diagnostics — best N + worst 1 ────────────────────────
         entry = {
-            'pred_synth':    pred_synth.cpu(),
-            'pred_labels':   pred_labels,
-            'aug_image':     aug_image.cpu(),
-            'real_image':    real_image.cpu(),
-            'aug_mask':      aug_mask.cpu(),
+            'pred_synth': pred_synth.cpu(),
+            'pred_labels': pred_labels,
+            'aug_image': aug_image.cpu(),
+            'real_image': real_image.cpu(),
+            'aug_mask': aug_mask.cpu(),
             'target_labels': target_labels,
-            'score':         -loss.item(),      # higher score = lower loss = better
-            'batch_idx':     batch_idx,
-            'subject_ids':   subject_ids,
+            'score': -loss.item(),  # higher score = lower loss = better
+            'batch_idx': batch_idx,
+            'subject_ids': subject_ids,
+            'subj_metrics': subj_metrics,
         }
 
         # Best cache: keep top-n_best_batches by highest score (lowest loss)
@@ -1457,7 +1457,7 @@ class Model(pl.LightningModule):
 
         # Worst cache: keep 1 by lowest score (highest loss)
         self._val_worst_cache.append(entry)
-        self._val_worst_cache.sort(key=lambda x: x['score'])   # ascending = worst first
+        self._val_worst_cache.sort(key=lambda x: x['score'])  # ascending = worst first
         self._val_worst_cache = self._val_worst_cache[:1]
 
         return loss
@@ -1500,9 +1500,6 @@ class Model(pl.LightningModule):
         subj_dir  = os.path.join(epoch_dir, f'{rank}_{subject_id}')
         makedirs(subj_dir, exist_ok=True)
 
-        print(f'\n[Saving] NIfTI diagnostics — Epoch {self.trainer.current_epoch}'
-              f'  [{rank}]  {subject_id}  →  {subj_dir}')
-
         save(pred_synth_argmax,                       os.path.join(subj_dir, 'synth-pred.nii.gz'))
         save(pred_real_argmax,                        os.path.join(subj_dir, 'real-pred.nii.gz'))
         save(aug_image[0].squeeze(0),                 os.path.join(subj_dir, 'synth-image.nii.gz'))
@@ -1521,8 +1518,8 @@ class Model(pl.LightningModule):
                 bd['real_image'].to(self.device),
                 bd['aug_mask'].to(self.device),
                 bd['target_labels'],
-                subject_id = subject_id,
-                rank       = 'best',
+                subject_id=subject_id,
+                rank='best',
             )
 
         for bd in self._val_worst_cache:
@@ -1534,20 +1531,17 @@ class Model(pl.LightningModule):
                 bd['real_image'].to(self.device),
                 bd['aug_mask'].to(self.device),
                 bd['target_labels'],
-                subject_id = subject_id,
-                rank       = 'worst',
+                subject_id=subject_id,
+                rank='worst',
             )
 
-        self._val_batch_cache = []
-        self._val_worst_cache = []
-
         # ── Epoch-level metrics ───────────────────────────────────────────────────
-        dice_epoch   = self.val_dice.compute()
+        dice_epoch = self.val_dice.compute()
         dice_per_cls = self.val_dice_fcd.compute()
-        dice_fcd     = dice_per_cls[5] if len(dice_per_cls) > 5 else torch.tensor(0.0)
+        dice_fcd = dice_per_cls[5] if len(dice_per_cls) > 5 else torch.tensor(0.0)
 
-        self.log('val_dice',     dice_epoch, prog_bar=True)
-        self.log('val_dice_fcd', dice_fcd,   prog_bar=False)
+        self.log('val_dice', dice_epoch, prog_bar=True)
+        self.log('val_dice_fcd', dice_fcd, prog_bar=False)
 
         # ── Step LR scheduler manually (required with automatic_optimization=False) ──
         sch = self.lr_schedulers()
@@ -1565,7 +1559,20 @@ class Model(pl.LightningModule):
         print(f"  Eval Loss     : {float(el):.4f}")
         print(f"  DICE SCORE    : {dice_epoch:.4f}")
         print(f"  DICE FCD (c6) : {dice_fcd:.4f}")
+
+        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0:
+            print(f"  ── Subject Diagnostics ────────────────")
+            for bd in self._val_batch_cache:
+                for m in bd.get('subj_metrics', []):
+                    print(f"  best  {m['id']}  dice={m['dice']:.4f}  fcd={m['fcd']:.4f}")
+            for bd in self._val_worst_cache:
+                for m in bd.get('subj_metrics', []):
+                    print(f"  worst {m['id']}  dice={m['dice']:.4f}  fcd={m['fcd']:.4f}")
+
         print(f"{'=' * 40}\n")
+
+        self._val_batch_cache = []
+        self._val_worst_cache = []
 
         self.val_dice.reset()
         self.val_dice_fcd.reset()
@@ -1900,6 +1907,7 @@ class CheckpointTraceCallback(Callback):
         print(f"\n[CKPT TRACE] ❌ EXCEPTION: {type(exception).__name__}: {exception}")
         traceback.print_exc()
 
+
 # ── CLI & Main ────────────────────────────────────────────────────────────────
 class CLI(LightningCLI):
     def add_arguments_to_parser(self, parser):
@@ -1967,6 +1975,7 @@ class CLI(LightningCLI):
         kwargs["logger"]                = logger
         kwargs["callbacks"]             = cbs
         return super().instantiate_trainer(**kwargs)
+
 
 if __name__ == '__main__':
     cli = CLI(Model, FCDDataModule, save_config_kwargs={"overwrite": True})
