@@ -1379,7 +1379,7 @@ class Model(pl.LightningModule):
         # ── Per-subject metrics (every 10 epochs) ─────────────────────────────────
         # Iterates over subjects in the batch individually so each gets its own
         # Dice and loss logged under val_dice_<subject_id> / val_loss_<subject_id>.
-        if self.trainer.current_epoch % 10 == 0:
+        if self.trainer.current_epoch % 2 == 0:
             _m = dict(include_background=False, num_classes=self.hparams.nb_classes,
                       input_format='index')
             for j, subj_id in enumerate(subject_ids):
@@ -1457,7 +1457,7 @@ class Model(pl.LightningModule):
         self.log('pred_real_num_classes',
                  float(len(torch.unique(pred_real_argmax))), prog_bar=False)
 
-        if self.trainer.current_epoch % 10 != 0:
+        if self.trainer.current_epoch % 2 != 0:
             return
 
         base_dir  = self.trainer.log_dir or self.trainer.default_root_dir
