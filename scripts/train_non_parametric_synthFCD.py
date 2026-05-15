@@ -844,6 +844,7 @@ class Model(pl.LightningModule):
             flair_stats_csv: Optional[str] = FLAIR_STATS_CSV,
             n_best_batches: int = 2,
             native_synthesis: bool = False,
+            val_diagnostics_interval: int = 10,
             lesion_gmm_params: Optional[dict] = None,  # GMM (μ, σ) for label 21 — native path only
             debug_subject_ids: Optional[list] = None,  # subject IDs to save pipeline stages for
     ):
@@ -873,6 +874,7 @@ class Model(pl.LightningModule):
         self.alpha                = alpha
         self.flair_stats_csv      = flair_stats_csv
         self.target_labels        = self.TARGET_LABELS
+        self.val_diagnostics_interval  = val_diagnostics_interval
 
         # ── Sub-modules ───────────────────────────────────────────────────────
         self.subject_params_cache   = self._load_subject_params()
@@ -1336,7 +1338,7 @@ class Model(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         # Periodically free CUDA cache to prevent fragmentation over long runs
-        if self.trainer.current_epoch % 2 == 0 and batch_idx == 0:
+        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0 and batch_idx == 0:
             torch.cuda.empty_cache()
 
         result = self.synthesize_batch(batch)
@@ -1379,7 +1381,7 @@ class Model(pl.LightningModule):
         # ── Per-subject metrics (every 10 epochs) ─────────────────────────────────
         # Iterates over subjects in the batch individually so each gets its own
         # Dice and loss logged under val_dice_<subject_id> / val_loss_<subject_id>.
-        if self.trainer.current_epoch % 2 == 0:
+        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0:
             _m = dict(include_background=False, num_classes=self.hparams.nb_classes,
                       input_format='index')
             for j, subj_id in enumerate(subject_ids):
@@ -1457,7 +1459,7 @@ class Model(pl.LightningModule):
         self.log('pred_real_num_classes',
                  float(len(torch.unique(pred_real_argmax))), prog_bar=False)
 
-        if self.trainer.current_epoch % 2 != 0:
+        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval != 0:
             return
 
         base_dir  = self.trainer.log_dir or self.trainer.default_root_dir
