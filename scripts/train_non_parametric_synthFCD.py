@@ -73,6 +73,14 @@ from learn2synth.configurations import (
     BLUR_SUBJECTS,
     THICKENING_SUBJECTS,
 )
+import warnings
+warnings.filterwarnings("ignore", message=".*weights_only.*")
+warnings.filterwarnings("ignore", message=".*DiceScore metric currently defaults.*")
+warnings.filterwarnings("ignore", message=".*batch_size.*ambiguous collection.*")
+warnings.filterwarnings("ignore", message=".*lr scheduler dict contains.*")
+warnings.filterwarnings("ignore", message=".*Precision 16-mixed is not supported.*")
+warnings.filterwarnings("ignore", message=".*Checkpoint directory.*exists and is not empty.*")
+warnings.filterwarnings("ignore", message=".*Experiment logs directory.*exists and is not empty.*")
 
 
 # ── FCDDataset ────────────────────────────────────────────────────────────────
@@ -702,8 +710,6 @@ class SynthesisPipelineDebugger:
         if fusedmask_t is not None:
             self._log_stats(subject_id, "stage0_input_fusedmask", fusedmask_t)
 
-        print(f"[PipelineDebug] {subject_id} | Stage 0 saved → {out_dir}")
-
     def save_stage1_after_synth(
         self,
         subject_id: str,
@@ -728,7 +734,6 @@ class SynthesisPipelineDebugger:
         self._log_stats(subject_id, "stage1_rimg",     rimg)
         self._log_stats(subject_id, "stage1_rlab_out", rlab_out)
 
-        print(f"[PipelineDebug] {subject_id} | Stage 1 saved → {out_dir}")
 
     def save_stage2_after_fcd_aug(
         self,
@@ -744,14 +749,12 @@ class SynthesisPipelineDebugger:
         self._save_nii(rroi_3d.squeeze(), out_dir, "stage2_after_fcd_aug_roi.nii.gz", dtype=np.uint8)
 
         self._log_stats(subject_id, f"stage2_after_fcd_aug (choices={choices})", aug_img)
-        print(f"[PipelineDebug] {subject_id} | Stage 2 (FCD aug: {choices}) saved → {out_dir}")
 
     def save_stage3_after_intensity(self, subject_id: str, aug_image_item: torch.Tensor):
         """Stage 3 — final aug_image_item after IntensityTransform, normalized to [0,1]."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
         self._save_nii(aug_image_item.squeeze(), out_dir, "stage3_after_intensity.nii.gz", dtype=np.float32)
         self._log_stats(subject_id, "stage3_after_intensity", aug_image_item)
-        print(f"[PipelineDebug] {subject_id} | Stage 3 (intensity aug) saved → {out_dir}")
 
     def save_stage4_label_fusion(
         self,
@@ -768,14 +771,12 @@ class SynthesisPipelineDebugger:
         self._log_stats(subject_id, "stage4_slab_with_fcd", slab_with_fcd)
         self._log_stats(subject_id, "stage4_rlab_with_fcd", rlab_with_fcd)
 
-        print(f"[PipelineDebug] {subject_id} | Stage 4 (label fusion) saved → {out_dir}")
 
     def save_stage5_after_intensity(self, subject_id: str, real_image_item: torch.Tensor):
         """Stage 5 — final rimg after IntensityTransform, normalized to [0,1]."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
         self._save_nii(real_image_item.squeeze(), out_dir, "stage5_after_intensity.nii.gz", dtype=np.float32)
         self._log_stats(subject_id, "stage5_after_intensity", real_image_item)
-        print(f"[PipelineDebug] {subject_id} | Stage 5 (intensity aug) saved → {out_dir}")
 
     def mark_saved(self, subject_id: str):
         """Call after all stages are saved to prevent re-saving this subject."""
@@ -819,7 +820,6 @@ class SynthesisPipelineDebugger:
                 f.write(line)
         except Exception as e:
             print(f"[PipelineDebug] WARNING: could not log stats for {stage_name}: {e}")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Model  —  6-class grouped segmentation (brain structures + FCD lesion)
@@ -1848,8 +1848,6 @@ class EveryEpochCheckpointCallback(Callback):
             trainer.save_checkpoint(ckpt_path)
             size_mb = os.path.getsize(ckpt_path) / 1e6
             mtime = datetime.datetime.fromtimestamp(os.path.getmtime(ckpt_path))
-            print(f"[EveryEpoch] ✅ epoch={trainer.current_epoch} → "
-                  f"{ckpt_path} ({size_mb:.1f} MB, mtime {mtime})")
         except Exception as e:
             print(f"[EveryEpoch] ❌ Save FAILED at epoch "
                   f"{trainer.current_epoch}: {type(e).__name__}: {e}")
@@ -1865,48 +1863,15 @@ class EveryEpochCheckpointCallback(Callback):
 # ══════════════════════════════════════════════════════════════════════════════
 class CheckpointTraceCallback(Callback):
 
-    def on_validation_epoch_start(self, trainer, pl_module):
-        print(f"\n[CKPT TRACE] === Epoch {trainer.current_epoch}: validation starting ===")
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        _, _, free = shutil.disk_usage(OUTPUT_FOLDER)
-        print(f"[CKPT TRACE] Epoch {trainer.current_epoch}: validation hooks running. "
-              f"Disk free={free / 1e9:.2f}GB, should_stop={trainer.should_stop}")
-
     def on_train_epoch_end(self, trainer, pl_module):
-        epoch = trainer.current_epoch
         mc = next((cb for cb in trainer.callbacks
                    if type(cb).__name__ == "ModelCheckpoint"), None)
         if mc is None:
-            print(f"[CKPT TRACE] Epoch {epoch}: no ModelCheckpoint found!")
-            return
-
-        ckpt_dir = mc.dirpath or os.path.join(trainer.log_dir or '.', 'checkpoints')
-        print(f"[CKPT TRACE] Epoch {epoch}: post-epoch checkpoint state:")
-        print(f"  ModelCheckpoint.last_model_path  = {mc.last_model_path}")
-        print(f"  ModelCheckpoint.best_model_path  = {mc.best_model_path}")
-        print(f"  ModelCheckpoint.best_model_score = {mc.best_model_score}")
-
-        if os.path.isdir(ckpt_dir):
-            for fname, label in [('resume.ckpt', 'resume.ckpt'), ('last.ckpt', 'last.ckpt  ')]:
-                fpath = os.path.join(ckpt_dir, fname)
-                if os.path.exists(fpath):
-                    mb = os.path.getsize(fpath) / 1e6
-                    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(fpath))
-                    print(f"  {label} on disk: {mb:.1f} MB, mtime {mtime}")
-                else:
-                    print(f"  {label} DOES NOT EXIST on disk")
-
-            n_ckpts = len([f for f in os.listdir(ckpt_dir) if f.endswith('.ckpt')])
-            print(f"  total ckpt files   : {n_ckpts}")
-
-        _, _, free = shutil.disk_usage(OUTPUT_FOLDER)
-        print(f"  disk free          = {free / 1e9:.2f}GB")
+            print(f"[CKPT TRACE] Epoch {trainer.current_epoch}: no ModelCheckpoint found!")
 
     def on_exception(self, trainer, pl_module, exception):
         print(f"\n[CKPT TRACE] ❌ EXCEPTION: {type(exception).__name__}: {exception}")
         traceback.print_exc()
-
 
 # ── CLI & Main ────────────────────────────────────────────────────────────────
 class CLI(LightningCLI):
