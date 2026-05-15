@@ -895,7 +895,8 @@ class Model(pl.LightningModule):
 
         # ── State ─────────────────────────────────────────────────────────────
         self.n_best_batches    = n_best_batches
-        self._val_batch_cache  = []
+        self._val_batch_cache  = []   # top-n_best_batches entries by lowest loss
+        self._val_worst_cache  = []   # 1 entry with highest loss
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Lifecycle hooks
@@ -1216,7 +1217,7 @@ class Model(pl.LightningModule):
             # slab_out and rlab_out already have class 6 from remap_labels — no label fusion needed
             rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
             rimg_norm = self.rimg_normalizer.make_final(rimg_norm)(rimg_norm)
-            rimg_out = self.intensity_aug(rimg_norm)
+            rimg_out  = self.intensity_aug(rimg_norm)
             rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
 
             # ── Debug: Stage 5 — rimg after normalization + IntensityTransform ──────
@@ -1285,7 +1286,7 @@ class Model(pl.LightningModule):
 
         rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
         rimg_norm = self.rimg_normalizer.make_final(rimg_norm)(rimg_norm)
-        rimg_out = self.intensity_aug(rimg_norm)
+        rimg_out  = self.intensity_aug(rimg_norm)
         rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
 
         # ── Debug: Stage 5 — rimg after normalization + IntensityTransform ──────────
@@ -1300,14 +1301,23 @@ class Model(pl.LightningModule):
         )
 
     def synthesize_batch(self, batch: dict):
-        """Run the synthesis pipeline for every sample. Returns stacked tensors."""
-        results     = []
-        device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
+        """
+        Run the synthesis pipeline for every sample in the batch.
+        Returns stacked tensors + a list of subject_ids that survived synthesis
+        (samples that returned None are excluded from both).
+        """
+        results      = []
+        subject_ids  = []
+        n            = len(batch['label_t'])
+        sid_list     = batch.get('subject_id', [None] * n)
+        device_type  = 'cuda' if self.device.type == 'cuda' else 'cpu'
+
         with torch.autocast(device_type=device_type, enabled=False):
-            for i in range(len(batch['label_t'])):
+            for i in range(n):
                 out = self._process_single_sample(batch, i)
                 if out is not None:
                     results.append(out)
+                    subject_ids.append(sid_list[i])
             if not results:
                 return None
 
@@ -1317,6 +1327,7 @@ class Model(pl.LightningModule):
             torch.stack(aug_masks).long(),
             torch.stack(real_images).float(),
             torch.stack(real_masks).long(),
+            subject_ids,                        # ← list of str|None, same length as batch dim
         )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1331,13 +1342,14 @@ class Model(pl.LightningModule):
         result = self.synthesize_batch(batch)
         if result is None:
             return None
-        aug_image, aug_mask, real_image, real_mask = result
+        aug_image, aug_mask, real_image, real_mask, _ = result  # subject_ids unused in training
 
         loss_synth, loss_real = self.network.train_step(
             aug_image, aug_mask, real_image, real_mask)
 
-        loss = loss_synth + self.alpha * loss_real
-        self.log('train_loss', loss, prog_bar=True)
+        loss              = loss_synth + self.alpha * loss_real
+        actual_batch_size = aug_image.shape[0]
+        self.log('train_loss', loss, prog_bar=True, batch_size=actual_batch_size)
         return loss
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1349,7 +1361,7 @@ class Model(pl.LightningModule):
             result = self.synthesize_batch(batch)
             if result is None:
                 return None
-            aug_image, aug_mask, real_image, real_mask = result
+            aug_image, aug_mask, real_image, real_mask, subject_ids = result
 
             loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
                 aug_image, aug_mask, real_image, real_mask)
@@ -1360,27 +1372,84 @@ class Model(pl.LightningModule):
         self.val_dice.update(pred_labels, target_labels)
         self.val_dice_fcd.update(pred_labels, target_labels)
 
-        loss = loss_synth + self.alpha * loss_real
-        self.log('eval_loss', loss, prog_bar=True)
+        loss              = loss_synth + self.alpha * loss_real
+        actual_batch_size = aug_image.shape[0]
+        self.log('eval_loss', loss, prog_bar=True, batch_size=actual_batch_size)
 
-        # Cache for top-N best-batch NIfTI diagnostics
-        self._val_batch_cache.append({
+        # ── Per-subject metrics (every 10 epochs) ─────────────────────────────────
+        # Iterates over subjects in the batch individually so each gets its own
+        # Dice and loss logged under val_dice_<subject_id> / val_loss_<subject_id>.
+        if self.trainer.current_epoch % 10 == 0:
+            _m = dict(include_background=False, num_classes=self.hparams.nb_classes,
+                      input_format='index')
+            for j, subj_id in enumerate(subject_ids):
+                if subj_id is None:
+                    continue
+
+                subj_pred_labels = pred_labels[j:j+1]
+                subj_target      = target_labels[j:j+1]
+                subj_pred_logits = pred_real[j:j+1]
+                subj_mask        = real_mask[j:j+1]
+
+                # Dice — fresh metric instance to avoid state bleed between subjects
+                _dice = dice_compute(average='micro', **_m)
+                _dice.update(subj_pred_labels, subj_target)
+                subj_dice = _dice.compute()
+
+                # Loss
+                subj_loss = self.network.loss(subj_pred_logits, subj_mask)
+
+                self.log(f'val_dice_{subj_id}', subj_dice,        prog_bar=False)
+                self.log(f'val_loss_{subj_id}', subj_loss.item(), prog_bar=False)
+
+        # ── Cache for NIfTI diagnostics — best N + worst 1 ────────────────────────
+        entry = {
             'pred_synth':    pred_synth.cpu(),
             'pred_labels':   pred_labels,
             'aug_image':     aug_image.cpu(),
             'real_image':    real_image.cpu(),
             'aug_mask':      aug_mask.cpu(),
             'target_labels': target_labels,
-            'score':         -loss.item(),  # lower loss = higher score
+            'score':         -loss.item(),      # higher score = lower loss = better
             'batch_idx':     batch_idx,
-        })
+            'subject_ids':   subject_ids,
+        }
+
+        # Best cache: keep top-n_best_batches by highest score (lowest loss)
+        self._val_batch_cache.append(entry)
         self._val_batch_cache.sort(key=lambda x: x['score'], reverse=True)
         self._val_batch_cache = self._val_batch_cache[:self.n_best_batches]
 
+        # Worst cache: keep 1 by lowest score (highest loss)
+        self._val_worst_cache.append(entry)
+        self._val_worst_cache.sort(key=lambda x: x['score'])   # ascending = worst first
+        self._val_worst_cache = self._val_worst_cache[:1]
+
         return loss
 
-    def _log_val_diagnostics(self, pred_synth, pred_labels, aug_image, real_image, aug_mask, real_labels, suffix=''):
-        """Log class-count scalars and save NIfTI samples every 20 epochs."""
+    def _log_val_diagnostics(
+            self,
+            pred_synth,
+            pred_labels,
+            aug_image,
+            real_image,
+            aug_mask,
+            real_labels,
+            subject_id: str = 'unknown',
+            rank: str = 'best',
+    ):
+        """
+        Log class-count scalars and save NIfTI samples every 10 epochs.
+
+        NIfTIs are written to:
+            <log_dir>/images/epoch-<XXXX>/<rank>_<subject_id>/
+                synth-pred.nii.gz
+                synth-image.nii.gz
+                synth-ref.nii.gz
+                real-pred.nii.gz
+                real-image.nii.gz
+                real-ref.nii.gz
+        """
         pred_synth_argmax = pred_synth[0].argmax(dim=0)
         pred_real_argmax  = pred_labels[0]
         self.log('pred_synth_num_classes',
@@ -1388,26 +1457,28 @@ class Model(pl.LightningModule):
         self.log('pred_real_num_classes',
                  float(len(torch.unique(pred_real_argmax))), prog_bar=False)
 
-        if self.trainer.current_epoch % 20 != 0:
+        if self.trainer.current_epoch % 10 != 0:
             return
 
-        base_dir = self.trainer.log_dir or self.trainer.default_root_dir
-        img_root = os.path.join(base_dir, 'images')
-        makedirs(img_root, exist_ok=True)
-        print(f'\n[Saving] NIfTI diagnostics — Epoch {self.trainer.current_epoch}'
-              f' {suffix} → {img_root}')
+        base_dir  = self.trainer.log_dir or self.trainer.default_root_dir
+        epoch_dir = os.path.join(base_dir, 'images', f'epoch-{self.trainer.current_epoch:04d}')
+        subj_dir  = os.path.join(epoch_dir, f'{rank}_{subject_id}')
+        makedirs(subj_dir, exist_ok=True)
 
-        p = f'{img_root}/epoch-{self.trainer.current_epoch:04d}'
-        save(pred_synth_argmax,                       f'{p}_{suffix}_synth-pred.nii.gz')
-        save(pred_real_argmax,                        f'{p}_{suffix}_real-pred.nii.gz')
-        save(aug_image[0].squeeze(0),                 f'{p}_{suffix}_synth-image.nii.gz')
-        save(real_image[0].squeeze(0),                f'{p}_{suffix}_real-image.nii.gz')
-        save(aug_mask[0].squeeze(0).to(torch.uint8),  f'{p}_{suffix}_synth-ref.nii.gz')
-        save(real_labels[0].to(torch.uint8),          f'{p}_{suffix}_real-ref.nii.gz')
+        print(f'\n[Saving] NIfTI diagnostics — Epoch {self.trainer.current_epoch}'
+              f'  [{rank}]  {subject_id}  →  {subj_dir}')
+
+        save(pred_synth_argmax,                       os.path.join(subj_dir, 'synth-pred.nii.gz'))
+        save(pred_real_argmax,                        os.path.join(subj_dir, 'real-pred.nii.gz'))
+        save(aug_image[0].squeeze(0),                 os.path.join(subj_dir, 'synth-image.nii.gz'))
+        save(real_image[0].squeeze(0),                os.path.join(subj_dir, 'real-image.nii.gz'))
+        save(aug_mask[0].squeeze(0).to(torch.uint8),  os.path.join(subj_dir, 'synth-ref.nii.gz'))
+        save(real_labels[0].to(torch.uint8),          os.path.join(subj_dir, 'real-ref.nii.gz'))
 
     def on_validation_epoch_end(self):
-        # Save NIfTI diagnostics for the best N cached batches
-        for i, bd in enumerate(self._val_batch_cache):
+        # ── Save NIfTI diagnostics for best N + worst 1 cached batches ───────────
+        for bd in self._val_batch_cache:
+            subject_id = bd['subject_ids'][0] if bd['subject_ids'] else 'unknown'
             self._log_val_diagnostics(
                 bd['pred_synth'].to(self.device),
                 bd['pred_labels'],
@@ -1415,10 +1486,27 @@ class Model(pl.LightningModule):
                 bd['real_image'].to(self.device),
                 bd['aug_mask'].to(self.device),
                 bd['target_labels'],
-                suffix=f'_best{i}_batch{bd["batch_idx"]}',
+                subject_id = subject_id,
+                rank       = 'best',
             )
-        self._val_batch_cache = []
 
+        for bd in self._val_worst_cache:
+            subject_id = bd['subject_ids'][0] if bd['subject_ids'] else 'unknown'
+            self._log_val_diagnostics(
+                bd['pred_synth'].to(self.device),
+                bd['pred_labels'],
+                bd['aug_image'].to(self.device),
+                bd['real_image'].to(self.device),
+                bd['aug_mask'].to(self.device),
+                bd['target_labels'],
+                subject_id = subject_id,
+                rank       = 'worst',
+            )
+
+        self._val_batch_cache = []
+        self._val_worst_cache = []
+
+        # ── Epoch-level metrics ───────────────────────────────────────────────────
         dice_epoch   = self.val_dice.compute()
         dice_per_cls = self.val_dice_fcd.compute()
         dice_fcd     = dice_per_cls[5] if len(dice_per_cls) > 5 else torch.tensor(0.0)
