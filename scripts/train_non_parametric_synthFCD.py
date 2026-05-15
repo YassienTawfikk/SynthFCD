@@ -1549,9 +1549,13 @@ class Model(pl.LightningModule):
         self.log('val_dice',     dice_epoch, prog_bar=True)
         self.log('val_dice_fcd', dice_fcd,   prog_bar=False)
 
+        # ── Step LR scheduler manually (required with automatic_optimization=False) ──
+        sch = self.lr_schedulers()
+        if sch is not None:
+            sch.step(self.trainer.callback_metrics.get('eval_loss'))
+
         tl = self.trainer.callback_metrics.get('train_loss', -1)
         el = self.trainer.callback_metrics.get('eval_loss', -1)
-        # Log current LR from the scheduler Lightning manages
         current_lr = self.optimizers().param_groups[0]['lr']
 
         print(f"\n{'=' * 40}")
