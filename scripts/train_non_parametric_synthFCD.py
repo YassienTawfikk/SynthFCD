@@ -6,13 +6,25 @@ import sys
 import glob
 import math
 import random
-import shutil
 import datetime
 import traceback
+import warnings
+import re
 
 from typing import Sequence, Optional
 from os     import path, makedirs
 from random import shuffle
+
+# ── Warning suppression (before Lightning/torch imports) ────────────────────
+os.environ["PYTHONWARNINGS"] = "ignore:.*weights_only.*:FutureWarning"
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*weights_only.*")
+warnings.filterwarnings("ignore", message=".*DiceScore metric currently defaults.*")
+warnings.filterwarnings("ignore", message=".*batch_size.*ambiguous collection.*")
+warnings.filterwarnings("ignore", message=".*lr scheduler dict contains.*")
+warnings.filterwarnings("ignore", message=".*Precision 16-mixed is not supported.*")
+warnings.filterwarnings("ignore", message=".*Checkpoint directory.*exists and is not empty.*")
+warnings.filterwarnings("ignore", message=".*Experiment logs directory.*exists and is not empty.*")
+warnings.filterwarnings("ignore", message=".*isinstance.*LeafSpec.*deprecated.*")
 
 # ── Third-party libraries ───────────────────────────────────────────────────
 import numpy             as np
@@ -20,6 +32,13 @@ import pandas            as pd
 import torch
 import matplotlib.pyplot as plt
 import nibabel           as nib
+
+# ── torch.load patch (suppress weights_only FutureWarning) ──────────────────
+_original_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    kwargs.setdefault('weights_only', False)
+    return _original_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
 
 import pytorch_lightning         as pl
 from pytorch_lightning.cli       import LightningCLI
@@ -73,7 +92,6 @@ from learn2synth.configurations import (
     BLUR_SUBJECTS,
     THICKENING_SUBJECTS,
 )
-
 
 # ── FCDDataset ────────────────────────────────────────────────────────────────
 # Returns un-augmented volumes plus random augmentation configurations.
@@ -356,21 +374,29 @@ class FCDDataModule(pl.LightningDataModule):
             return
         self._setup_done = True
 
-        # Copy raw pool (and shuffle if requested) before splitting
+        # Copy raw pool before splitting
         raw_label_paths = list(self._raw_label_paths)
         raw_flair_paths = list(self._raw_flair_paths)
-        raw_roi_paths   = list(self._raw_roi_paths)
+        raw_roi_paths = list(self._raw_roi_paths)
         raw_fused_paths = list(self._raw_fused_paths)
 
-        if self.preshuffle:
+        # Shuffle raw pool before splitting — seeded (preshuffle=False) or unseeded (preshuffle=True)
+        # fused_paths excluded from zip when native_synthesis=False (empty list crashes zip)
+        if self.native_synthesis:
             combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths))
-            shuffle(combined)
-            raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
         else:
-            # seeded deterministic shuffle before split
-            combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths))
-            random.Random(self.split_seed).shuffle(combined)
-            raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
+            combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths))
+
+        if combined:
+            if self.preshuffle:
+                shuffle(combined)
+            else:
+                random.Random(self.split_seed).shuffle(combined)
+
+            if self.native_synthesis:
+                raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
+            else:
+                raw_label_paths, raw_flair_paths, raw_roi_paths = map(list, zip(*combined))
 
         def _count(param, total):
             if isinstance(param, float): return int(math.ceil(total * param))
@@ -383,18 +409,18 @@ class FCDDataModule(pl.LightningDataModule):
         val_label_paths = raw_label_paths[:n_val]
         val_flair_paths = raw_flair_paths[:n_val]
         val_roi_paths   = raw_roi_paths[:n_val]
-        val_fused_paths = raw_fused_paths[:n_val]  # ← fixed
+        val_fused_paths = raw_fused_paths[:n_val]
 
         train_raw_label_paths = raw_label_paths[n_val:]
         train_raw_flair_paths = raw_flair_paths[n_val:]
         train_raw_roi_paths   = raw_roi_paths[n_val:]
-        train_raw_fused_paths = raw_fused_paths[n_val:]  # ← fixed
+        train_raw_fused_paths = raw_fused_paths[n_val:]
 
         # Training set = remaining raw + all extra
         train_label_paths = train_raw_label_paths + list(self._extra_label_paths)
         train_flair_paths = train_raw_flair_paths + list(self._extra_flair_paths)
         train_roi_paths   = train_raw_roi_paths   + list(self._extra_roi_paths)
-        train_fused_paths = train_raw_fused_paths + list(self._extra_fused_paths)  # ← fixed
+        train_fused_paths = train_raw_fused_paths + list(self._extra_fused_paths)
 
         print(
             f"[FCDDataModule] Split: "
@@ -694,8 +720,6 @@ class SynthesisPipelineDebugger:
         if fusedmask_t is not None:
             self._log_stats(subject_id, "stage0_input_fusedmask", fusedmask_t)
 
-        print(f"[PipelineDebug] {subject_id} | Stage 0 saved → {out_dir}")
-
     def save_stage1_after_synth(
         self,
         subject_id: str,
@@ -720,7 +744,6 @@ class SynthesisPipelineDebugger:
         self._log_stats(subject_id, "stage1_rimg",     rimg)
         self._log_stats(subject_id, "stage1_rlab_out", rlab_out)
 
-        print(f"[PipelineDebug] {subject_id} | Stage 1 saved → {out_dir}")
 
     def save_stage2_after_fcd_aug(
         self,
@@ -736,14 +759,12 @@ class SynthesisPipelineDebugger:
         self._save_nii(rroi_3d.squeeze(), out_dir, "stage2_after_fcd_aug_roi.nii.gz", dtype=np.uint8)
 
         self._log_stats(subject_id, f"stage2_after_fcd_aug (choices={choices})", aug_img)
-        print(f"[PipelineDebug] {subject_id} | Stage 2 (FCD aug: {choices}) saved → {out_dir}")
 
     def save_stage3_after_intensity(self, subject_id: str, aug_image_item: torch.Tensor):
         """Stage 3 — final aug_image_item after IntensityTransform, normalized to [0,1]."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
         self._save_nii(aug_image_item.squeeze(), out_dir, "stage3_after_intensity.nii.gz", dtype=np.float32)
         self._log_stats(subject_id, "stage3_after_intensity", aug_image_item)
-        print(f"[PipelineDebug] {subject_id} | Stage 3 (intensity aug) saved → {out_dir}")
 
     def save_stage4_label_fusion(
         self,
@@ -760,14 +781,12 @@ class SynthesisPipelineDebugger:
         self._log_stats(subject_id, "stage4_slab_with_fcd", slab_with_fcd)
         self._log_stats(subject_id, "stage4_rlab_with_fcd", rlab_with_fcd)
 
-        print(f"[PipelineDebug] {subject_id} | Stage 4 (label fusion) saved → {out_dir}")
 
     def save_stage5_after_intensity(self, subject_id: str, real_image_item: torch.Tensor):
         """Stage 5 — final rimg after IntensityTransform, normalized to [0,1]."""
         out_dir = self._subject_dir(subject_id, self._aug_type_cache.get(subject_id, ""))
         self._save_nii(real_image_item.squeeze(), out_dir, "stage5_after_intensity.nii.gz", dtype=np.float32)
         self._log_stats(subject_id, "stage5_after_intensity", real_image_item)
-        print(f"[PipelineDebug] {subject_id} | Stage 5 (intensity aug) saved → {out_dir}")
 
     def mark_saved(self, subject_id: str):
         """Call after all stages are saved to prevent re-saving this subject."""
@@ -812,7 +831,6 @@ class SynthesisPipelineDebugger:
         except Exception as e:
             print(f"[PipelineDebug] WARNING: could not log stats for {stage_name}: {e}")
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  Model  —  6-class grouped segmentation (brain structures + FCD lesion)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -844,6 +862,7 @@ class Model(pl.LightningModule):
             flair_stats_csv: Optional[str] = FLAIR_STATS_CSV,
             n_best_batches: int = 2,
             native_synthesis: bool = False,
+            val_diagnostics_interval: int = 10,
             lesion_gmm_params: Optional[dict] = None,  # GMM (μ, σ) for label 21 — native path only
             debug_subject_ids: Optional[list] = None,  # subject IDs to save pipeline stages for
     ):
@@ -873,6 +892,7 @@ class Model(pl.LightningModule):
         self.alpha                = alpha
         self.flair_stats_csv      = flair_stats_csv
         self.target_labels        = self.TARGET_LABELS
+        self.val_diagnostics_interval  = val_diagnostics_interval
 
         # ── Sub-modules ───────────────────────────────────────────────────────
         self.subject_params_cache   = self._load_subject_params()
@@ -950,8 +970,12 @@ class Model(pl.LightningModule):
             print(f"  Subjects to debug      : {sorted(dbg.debug_subject_ids)}")
             print(f"  Output root            : {dbg.output_root}")
             print(f"  Save once per subject  : {dbg.save_once}")
-            print(f"  Stages saved           : 0=inputs, 1=synth, 2=clamp(flair), "
-                  f"3=fcd_aug(non-native), 4=intensity, 5=label_fusion(non-native)")
+            if self.hparams.native_synthesis:
+                print(f"  Stages saved           : 0=inputs, 1=synth, "
+                      f"3=intensity, 5=rimg_intensity")
+            else:
+                print(f"  Stages saved           : 0=inputs, 1=synth, "
+                      f"2=fcd_aug, 3=intensity, 4=label_fusion, 5=rimg_intensity")
         else:
             print(f"\n  Pipeline Debugger      : DISABLED (no debug_subject_ids set)")
 
@@ -1057,6 +1081,17 @@ class Model(pl.LightningModule):
         if aug_type == 'combo':
             return random.sample(['blur', 'zoom', 'hyper', 'trans'], random.randint(1, 4))
         return aug_type.split('+')
+
+    @staticmethod
+    def _fmt_lr(lr: float) -> str:
+        """Format learning rate in math notation e.g. 1.00×10⁻⁴"""
+        s = f"{lr:.2e}"
+        return re.sub(
+            r"e([+-])0*(\d+)",
+            lambda m: f"×10{'⁻' if m.group(1) == '-' else '⁺'}"
+                      f"{''.join('⁰¹²³⁴⁵⁶⁷⁸⁹'[int(d)] for d in m.group(2))}",
+            s
+        )
 
     def _apply_fcd_augmentations(
             self,
@@ -1336,7 +1371,7 @@ class Model(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         # Periodically free CUDA cache to prevent fragmentation over long runs
-        if self.trainer.current_epoch % 10 == 0 and batch_idx == 0:
+        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0 and batch_idx == 0:
             torch.cuda.empty_cache()
 
         result = self.synthesize_batch(batch)
@@ -1379,7 +1414,7 @@ class Model(pl.LightningModule):
         # ── Per-subject metrics (every 10 epochs) ─────────────────────────────────
         # Iterates over subjects in the batch individually so each gets its own
         # Dice and loss logged under val_dice_<subject_id> / val_loss_<subject_id>.
-        if self.trainer.current_epoch % 10 == 0:
+        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0:
             _m = dict(include_background=False, num_classes=self.hparams.nb_classes,
                       input_format='index')
             for j, subj_id in enumerate(subject_ids):
@@ -1457,7 +1492,7 @@ class Model(pl.LightningModule):
         self.log('pred_real_num_classes',
                  float(len(torch.unique(pred_real_argmax))), prog_bar=False)
 
-        if self.trainer.current_epoch % 10 != 0:
+        if self.trainer.current_epoch % self.hparams.val_diagnostics_interval != 0:
             return
 
         base_dir  = self.trainer.log_dir or self.trainer.default_root_dir
@@ -1514,19 +1549,23 @@ class Model(pl.LightningModule):
         self.log('val_dice',     dice_epoch, prog_bar=True)
         self.log('val_dice_fcd', dice_fcd,   prog_bar=False)
 
+        # ── Step LR scheduler manually (required with automatic_optimization=False) ──
+        sch = self.lr_schedulers()
+        if sch is not None:
+            sch.step(self.trainer.callback_metrics.get('eval_loss'))
+
         tl = self.trainer.callback_metrics.get('train_loss', -1)
         el = self.trainer.callback_metrics.get('eval_loss', -1)
+        current_lr = self.optimizers().param_groups[0]['lr']
+
         print(f"\n{'=' * 40}")
         print(f"EPOCH {self.trainer.current_epoch} SUMMARY:")
+        print(f"  LR            : {self._fmt_lr(current_lr)}")
         print(f"  Train Loss    : {float(tl):.4f}")
         print(f"  Eval Loss     : {float(el):.4f}")
         print(f"  DICE SCORE    : {dice_epoch:.4f}")
         print(f"  DICE FCD (c6) : {dice_fcd:.4f}")
         print(f"{'=' * 40}\n")
-
-        # Log current LR from the scheduler Lightning manages
-        current_lr = self.optimizers().param_groups[0]['lr']
-        print(f'  LR            : {current_lr:.2e}')
 
         self.val_dice.reset()
         self.val_dice_fcd.reset()
@@ -1808,8 +1847,6 @@ class LossGraphCallback(Callback):
             finally:
                 plt.close()
 
-            print(f"[LossGraph] Updated plot → {plot_path}")
-
         except Exception as e:
             print(f"[LossGraph] ❌ Error at epoch {trainer.current_epoch}: "
                   f"{type(e).__name__}: {e}")
@@ -1838,8 +1875,6 @@ class EveryEpochCheckpointCallback(Callback):
             trainer.save_checkpoint(ckpt_path)
             size_mb = os.path.getsize(ckpt_path) / 1e6
             mtime = datetime.datetime.fromtimestamp(os.path.getmtime(ckpt_path))
-            print(f"[EveryEpoch] ✅ epoch={trainer.current_epoch} → "
-                  f"{ckpt_path} ({size_mb:.1f} MB, mtime {mtime})")
         except Exception as e:
             print(f"[EveryEpoch] ❌ Save FAILED at epoch "
                   f"{trainer.current_epoch}: {type(e).__name__}: {e}")
@@ -1855,62 +1890,28 @@ class EveryEpochCheckpointCallback(Callback):
 # ══════════════════════════════════════════════════════════════════════════════
 class CheckpointTraceCallback(Callback):
 
-    def on_validation_epoch_start(self, trainer, pl_module):
-        print(f"\n[CKPT TRACE] === Epoch {trainer.current_epoch}: validation starting ===")
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        _, _, free = shutil.disk_usage(OUTPUT_FOLDER)
-        print(f"[CKPT TRACE] Epoch {trainer.current_epoch}: validation hooks running. "
-              f"Disk free={free / 1e9:.2f}GB, should_stop={trainer.should_stop}")
-
     def on_train_epoch_end(self, trainer, pl_module):
-        epoch = trainer.current_epoch
         mc = next((cb for cb in trainer.callbacks
                    if type(cb).__name__ == "ModelCheckpoint"), None)
         if mc is None:
-            print(f"[CKPT TRACE] Epoch {epoch}: no ModelCheckpoint found!")
-            return
-
-        ckpt_dir = mc.dirpath or os.path.join(trainer.log_dir or '.', 'checkpoints')
-        print(f"[CKPT TRACE] Epoch {epoch}: post-epoch checkpoint state:")
-        print(f"  ModelCheckpoint.last_model_path  = {mc.last_model_path}")
-        print(f"  ModelCheckpoint.best_model_path  = {mc.best_model_path}")
-        print(f"  ModelCheckpoint.best_model_score = {mc.best_model_score}")
-
-        if os.path.isdir(ckpt_dir):
-            for fname, label in [('resume.ckpt', 'resume.ckpt'), ('last.ckpt', 'last.ckpt  ')]:
-                fpath = os.path.join(ckpt_dir, fname)
-                if os.path.exists(fpath):
-                    mb = os.path.getsize(fpath) / 1e6
-                    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(fpath))
-                    print(f"  {label} on disk: {mb:.1f} MB, mtime {mtime}")
-                else:
-                    print(f"  {label} DOES NOT EXIST on disk")
-
-            n_ckpts = len([f for f in os.listdir(ckpt_dir) if f.endswith('.ckpt')])
-            print(f"  total ckpt files   : {n_ckpts}")
-
-        _, _, free = shutil.disk_usage(OUTPUT_FOLDER)
-        print(f"  disk free          = {free / 1e9:.2f}GB")
+            print(f"[CKPT TRACE] Epoch {trainer.current_epoch}: no ModelCheckpoint found!")
 
     def on_exception(self, trainer, pl_module, exception):
         print(f"\n[CKPT TRACE] ❌ EXCEPTION: {type(exception).__name__}: {exception}")
         traceback.print_exc()
-
 
 # ── CLI & Main ────────────────────────────────────────────────────────────────
 class CLI(LightningCLI):
     def add_arguments_to_parser(self, parser):
         parser.add_lightning_class_args(ModelCheckpoint, "checkpoint")
         parser.set_defaults({
-            "checkpoint.monitor": "eval_loss",
-            "checkpoint.save_last": True,
-            "checkpoint.save_top_k": 1,
-            "checkpoint.filename": "checkpoint-{epoch:02d}-{eval_loss:.2f}-{val_dice:.2f}",
+            "checkpoint.monitor":        "eval_loss",
+            "checkpoint.save_last":      True,
+            "checkpoint.save_top_k":     1,
+            "checkpoint.filename":       "checkpoint-{epoch:02d}-{eval_loss:.2f}-{val_dice:.2f}",
             "checkpoint.every_n_epochs": 1,
         })
-        parser.link_arguments("model.native_synthesis", "data.native_synthesis")  # ← add
-
+        parser.link_arguments("model.native_synthesis", "data.native_synthesis")
 
     def instantiate_trainer(self, **kwargs):
         run_name = os.environ.get(
@@ -1918,7 +1919,8 @@ class CLI(LightningCLI):
             f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}",
         )
         default_root = kwargs.get("default_root_dir", "experiments")
-        save_dir = os.path.join(default_root, run_name)
+        save_dir     = os.path.join(default_root, run_name)
+        ckpt_dir     = os.path.join(save_dir, "checkpoints")
         makedirs(save_dir, exist_ok=True)
 
         print(f"[System] Initializing Run: {run_name}")
@@ -1937,17 +1939,34 @@ class CLI(LightningCLI):
         cbs.append(LossGraphCallback())
         cbs.append(CheckpointTraceCallback())
 
+        # ── Additional checkpoints ────────────────────────────────────────────
+        cbs.append(ModelCheckpoint(
+            dirpath        = ckpt_dir,
+            monitor        = "val_dice",
+            mode           = "max",
+            save_top_k     = 1,
+            every_n_epochs = 1,
+            filename       = "best-dice-{epoch:02d}-{val_dice:.2f}",
+        ))
+        cbs.append(ModelCheckpoint(
+            dirpath        = ckpt_dir,
+            monitor        = "val_dice_fcd",
+            mode           = "max",
+            save_top_k     = 1,
+            every_n_epochs = 1,
+            filename       = "best-dice-fcd-{epoch:02d}-{val_dice_fcd:.2f}",
+        ))
+
         print("\n[CLI] Registered callbacks:")
         for i, cb in enumerate(cbs):
             print(f"  [{i}] {type(cb).__name__}")
         print()
 
-        kwargs["default_root_dir"] = save_dir
-        kwargs["enable_progress_bar"] = False
-        kwargs["logger"] = logger
-        kwargs["callbacks"] = cbs
+        kwargs["default_root_dir"]      = save_dir
+        kwargs["enable_progress_bar"]   = False
+        kwargs["logger"]                = logger
+        kwargs["callbacks"]             = cbs
         return super().instantiate_trainer(**kwargs)
-
 
 if __name__ == '__main__':
     cli = CLI(Model, FCDDataModule, save_config_kwargs={"overwrite": True})
