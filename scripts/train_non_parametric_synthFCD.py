@@ -364,13 +364,15 @@ class FCDDataModule(pl.LightningDataModule):
 
         if self.preshuffle:
             combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths))
-            shuffle(combined)
-            raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
+            if combined:
+                shuffle(combined)
+                raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
         else:
             # seeded deterministic shuffle before split
             combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths))
-            random.Random(self.split_seed).shuffle(combined)
-            raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
+            if combined:
+                random.Random(self.split_seed).shuffle(combined)
+                raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
 
         def _count(param, total):
             if isinstance(param, float): return int(math.ceil(total * param))
