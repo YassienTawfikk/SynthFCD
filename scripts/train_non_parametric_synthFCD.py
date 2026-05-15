@@ -10,6 +10,7 @@ import shutil
 import datetime
 import traceback
 import warnings
+import re
 
 from typing import Sequence, Optional
 from os     import path, makedirs
@@ -1081,6 +1082,17 @@ class Model(pl.LightningModule):
             return random.sample(['blur', 'zoom', 'hyper', 'trans'], random.randint(1, 4))
         return aug_type.split('+')
 
+    @staticmethod
+    def _fmt_lr(lr: float) -> str:
+        """Format learning rate in math notation e.g. 1.00×10⁻⁴"""
+        s = f"{lr:.2e}"
+        return re.sub(
+            r"e([+-])0*(\d+)",
+            lambda m: f"×10{'⁻' if m.group(1) == '-' else '⁺'}"
+                      f"{''.join('⁰¹²³⁴⁵⁶⁷⁸⁹'[int(d)] for d in m.group(2))}",
+            s
+        )
+
     def _apply_fcd_augmentations(
             self,
             img: torch.Tensor,
@@ -1544,11 +1556,11 @@ class Model(pl.LightningModule):
 
         print(f"\n{'=' * 40}")
         print(f"EPOCH {self.trainer.current_epoch} SUMMARY:")
+        print(f"  LR            : {self._fmt_lr(current_lr)}")
         print(f"  Train Loss    : {float(tl):.4f}")
         print(f"  Eval Loss     : {float(el):.4f}")
         print(f"  DICE SCORE    : {dice_epoch:.4f}")
         print(f"  DICE FCD (c6) : {dice_fcd:.4f}")
-        print(f"  LR            : {current_lr:.2e}")
         print(f"{'=' * 40}\n")
 
         self.val_dice.reset()
