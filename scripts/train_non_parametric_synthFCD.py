@@ -240,19 +240,21 @@ class FCDDataset(Dataset):
 # ──────────────────────────────────────────────────────────────────────────────
 class FCDDataModule(pl.LightningDataModule):
     def __init__(self,
-                 ndim: int                     = 3,
-                 dataset_path: str             = DEFAULT_FOLDER,
-                 eval: float                   = 0.04,
-                 preshuffle: bool              = False,
-                 split_seed: int               = 42,
-                 batch_size: int               = 1,
-                 shuffle: bool                 = True,
-                 num_workers: int              = 4,
-                 native_synthesis: bool        = False,
-                 train_subdir: str             = 'train',
-                 raw_subdir: Optional[str]     = 'raw',
-                 extra_subdirs: Optional[list] = None,
-                 use_extra_data: bool          = False):
+                 ndim: int                            = 3,
+                 dataset_path: str                    = DEFAULT_FOLDER,
+                 eval: float                          = 0.04,
+                 preshuffle: bool                     = False,
+                 split_seed: int                      = 42,
+                 batch_size: int                      = 1,
+                 shuffle: bool                        = True,
+                 num_workers: int                     = 4,
+                 native_synthesis: bool               = False,
+                 train_subdir: str                    = 'train',
+                 raw_subdir: Optional[str]            = 'raw',
+                 extra_subdirs: Optional[list]        = None,
+                 use_extra_data: bool                 = False,
+                 fcd_intensity_range: Optional[tuple] = None,
+                 fcd_tail_range:      Optional[tuple] = None):
         super().__init__()
 
         # --- Config ---
@@ -347,17 +349,21 @@ class FCDDataModule(pl.LightningDataModule):
         )
 
         if not self.native_synthesis:
-            print("[FCDDataModule] Computing FCD augmentation parameters…")
-            self._calc = FCDParameterCalculator()
-            self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(
-                dataset_path         = raw_root,
-                label_file           = label_file,
-                flair_file           = flair_file,
-                roi_file             = roi_file,
-                intensity_subjects   = INTENSITY_SUBJECTS,
-                transmantle_subjects = TRANSMANTLE_SUBJECTS,
-                auto_resample        = True,
-            )
+            if fcd_intensity_range is not None and fcd_tail_range is not None:
+                self.fcd_intensity_range = fcd_intensity_range
+                self.fcd_tail_range = fcd_tail_range
+            else:
+                print("[FCDDataModule] Computing FCD augmentation parameters…")
+                self._calc = FCDParameterCalculator()
+                self.fcd_intensity_range, self.fcd_tail_range = self._calc.calculate_fcd_parameters(
+                    dataset_path         = raw_root,
+                    label_file           = label_file,
+                    flair_file           = flair_file,
+                    roi_file             = roi_file,
+                    intensity_subjects   = INTENSITY_SUBJECTS,
+                    transmantle_subjects = TRANSMANTLE_SUBJECTS,
+                    auto_resample        = True,
+                )
         else:
             print("[FCDDataModule] native_synthesis=True — skipping FCD augmentation parameter computation.")
             self.fcd_intensity_range = (0.0, 0.0)
