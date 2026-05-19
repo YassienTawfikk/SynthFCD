@@ -387,16 +387,17 @@ class FCDDataModule(pl.LightningDataModule):
         else:
             combined = list(zip(raw_label_paths, raw_flair_paths, raw_roi_paths))
 
-        if combined:
-            if self.preshuffle:
-                shuffle(combined)
-            else:
-                random.Random(self.split_seed).shuffle(combined)
+        if self.split_seed != 0:
+            if combined:
+                if self.preshuffle:
+                    shuffle(combined)
+                else:
+                    random.Random(self.split_seed).shuffle(combined)
 
-            if self.native_synthesis:
-                raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
-            else:
-                raw_label_paths, raw_flair_paths, raw_roi_paths = map(list, zip(*combined))
+                if self.native_synthesis:
+                    raw_label_paths, raw_flair_paths, raw_roi_paths, raw_fused_paths = map(list, zip(*combined))
+                else:
+                    raw_label_paths, raw_flair_paths, raw_roi_paths = map(list, zip(*combined))
 
         def _count(param, total):
             if isinstance(param, float): return int(math.ceil(total * param))
