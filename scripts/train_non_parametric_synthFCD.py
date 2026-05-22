@@ -1410,13 +1410,13 @@ class Model(pl.LightningModule):
 
         loss = loss_synth + self.alpha * loss_real
         actual_batch_size = aug_image.shape[0]
+
         self.log('eval_loss', loss, prog_bar=True, batch_size=actual_batch_size)
 
         # ── Per-subject metrics ────────────────────────────────────────────────────
         # Computes Dice + FCD Dice per subject for cache and optional logging.
         # Logging only fires every val_diagnostics_interval epochs.
-        _m = dict(include_background=False, num_classes=self.hparams.nb_classes,
-                  input_format='index')
+        _m = dict(include_background=False, num_classes=self.hparams.nb_classes, input_format='index')
         subj_metrics = []
 
         for j, subj_id in enumerate(subject_ids):
@@ -1436,6 +1436,7 @@ class Model(pl.LightningModule):
             # FCD Dice (class 6 = index 5)
             _dice_fcd = dice_compute(average='none', **_m)
             _dice_fcd.update(subj_pred_labels, subj_target)
+
             subj_dice_per_cls = _dice_fcd.compute()
             subj_fcd = subj_dice_per_cls[5].item() if len(subj_dice_per_cls) > 5 else 0.0
 
@@ -1480,15 +1481,23 @@ class Model(pl.LightningModule):
             'subj_metrics': subj_metrics,
         }
 
-        # Best cache: keep top-n_tracked_batches by highest score (lowest loss)
+        # Guard against None from checkpoint resume with renamed hparam (was n_best_batches)
+        n = self.hparams.n_tracked_batches or 2
+
+        # Best cache: keep top-n by highest score (lowest loss)
         self._val_batch_cache.append(entry)
         self._val_batch_cache.sort(key=lambda x: x['score'], reverse=True)
-        self._val_batch_cache = self._val_batch_cache[:self.n_tracked_batches]
+        self._val_batch_cache = self._val_batch_cache[:n]
 
-        # Worst cache: keep top-n_tracked_batches by lowest score (highest loss)
+        # Worst cache: keep top-n by lowest score (highest loss),
+        # excluding any batch already in the best cache to avoid overlap
+        best_idxs = {e['batch_idx'] for e in self._val_batch_cache}
+
         self._val_worst_cache.append(entry)
         self._val_worst_cache.sort(key=lambda x: x['score'])  # ascending = worst first
-        self._val_worst_cache = self._val_worst_cache[:self.n_tracked_batches]
+        self._val_worst_cache = [
+            e for e in self._val_worst_cache if e['batch_idx'] not in best_idxs
+        ][:n]
 
         return loss
 
