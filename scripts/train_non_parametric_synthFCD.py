@@ -864,6 +864,7 @@ class Model(pl.LightningModule):
             n_tracked_batches: int = 2,
             native_synthesis: bool = False,
             val_diagnostics_interval: int = 10,
+            use_lr_scheduler: bool = False,
             lesion_gmm_params: Optional[dict] = None,  # GMM (μ, σ) for label 21 — native path only
             debug_subject_ids: Optional[list] = None,  # subject IDs to save pipeline stages for
     ):
@@ -894,6 +895,7 @@ class Model(pl.LightningModule):
         self.flair_stats_csv          = flair_stats_csv
         self.target_labels            = self.TARGET_LABELS
         self.val_diagnostics_interval = val_diagnostics_interval
+        self.use_lr_scheduler         = use_lr_scheduler
 
         # ── Sub-modules ───────────────────────────────────────────────────────
         self.subject_params_cache     = self._load_subject_params()
@@ -904,7 +906,6 @@ class Model(pl.LightningModule):
         self.intensity_aug            = self._build_intensity_aug()
         self.rimg_normalizer          = cc.QuantileTransform(clip=True)
         self.fcd_aug                  = FCDAugmentations()
-
         # ── Metrics ───────────────────────────────────────────────────────────
         _m                            = dict(include_background=False, num_classes=nb_classes, input_format='index')
         self.val_dice                 = dice_compute(average='micro', **_m)
@@ -1619,9 +1620,13 @@ class Model(pl.LightningModule):
     # ══════════════════════════════════════════════════════════════════════════
 
     def configure_optimizers(self):
-        opt_cls   = getattr(optim, self.optimizer_name)
+        opt_cls = getattr(optim, self.optimizer_name)
         optimizer = opt_cls(self.network.segnet.parameters(),
                             **(self.optimizer_options or {}))
+
+        if not self.hparams.use_lr_scheduler:
+            return optimizer
+
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', patience=10, factor=0.5, min_lr=1e-6,
         )
