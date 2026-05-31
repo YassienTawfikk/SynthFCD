@@ -98,7 +98,7 @@ class FCDDataset(Dataset):
             flair_paths,
             roi_paths,
             fused_paths                  = None,
-            native_synthesis: bool       = False,
+            approach: str                = 'synthFCD',
             fcd_intensity_range          = (0.02, 0.3602),
             fcd_tail_length_range        = (20, 50),
             blur_sigma_range             = (0.7, 1.7),
@@ -118,7 +118,8 @@ class FCDDataset(Dataset):
             trans_sigma_range: Range for transmantle signal intensity noise.
         """
         self.ndim                  = ndim
-        self.native_synthesis      = native_synthesis
+        self.approach              = approach
+        self.native_synthesis      = (approach == 'nativeSynth')
 
         self.fcd_intensity_range   = fcd_intensity_range
         self.fcd_tail_length_range = fcd_tail_length_range
@@ -248,7 +249,7 @@ class FCDDataModule(pl.LightningDataModule):
                  batch_size: int                      = 1,
                  shuffle: bool                        = True,
                  num_workers: int                     = 4,
-                 native_synthesis: bool               = False,
+                 approach: str                        = 'synthFCD',
                  train_subdir: str                    = 'train',
                  raw_subdir: Optional[str]            = 'raw',
                  extra_subdirs: Optional[list]        = None,
@@ -266,8 +267,16 @@ class FCDDataModule(pl.LightningDataModule):
         self.batch_size       = batch_size
         self.shuffle          = shuffle
         self.num_workers      = num_workers
-        self.native_synthesis = native_synthesis
+        self.approach         = approach
+        self.native_synthesis = (approach == 'nativeSynth')
         self.use_extra_data   = use_extra_data
+
+        # Generated subjects carry no genuine lesion signal in their FLAIR, so training
+        # real-supervised on them would feed the network mislabelled images.
+        if self.approach == 'normal' and self.use_extra_data:
+            self.use_extra_data = False
+            print("[FCDDataModule] approach='normal' — generated subjects have no real lesion "
+                  "in FLAIR; forcing use_extra_data=False (raw subjects only).")
 
         # --- Resolve directory layout ---
         if raw_subdir is None:
@@ -365,7 +374,7 @@ class FCDDataModule(pl.LightningDataModule):
                     auto_resample        = True,
                 )
         else:
-            print("[FCDDataModule] native_synthesis=True — skipping FCD augmentation parameter computation.")
+            print("[FCDDataModule] approach='nativeSynth' — skipping FCD augmentation parameter computation.")
             self.fcd_intensity_range = (0.0, 0.0)
             self.fcd_tail_range      = (0, 0)
 
@@ -437,13 +446,13 @@ class FCDDataModule(pl.LightningDataModule):
         self.train_ds = FCDDataset(
             self.ndim, train_label_paths, train_flair_paths, train_roi_paths,
             fused_paths      = train_fused_paths,
-            native_synthesis = self.native_synthesis,
+            approach         = self.approach,
             **kw,
         )
         self.eval_ds = FCDDataset(
             self.ndim, val_label_paths, val_flair_paths, val_roi_paths,
             fused_paths      = val_fused_paths,
-            native_synthesis = self.native_synthesis,
+            approach         = self.approach,
             **kw,
         )
 
@@ -469,11 +478,12 @@ class SharedSynth(torch.nn.Module):
 
     N_CLASSES = 18  # valid labels are 0..18 inclusive (19 values)
 
-    def __init__(self, synth, target_labels=None, native_synthesis: bool = False):
+    def __init__(self, synth, target_labels=None, approach: str = 'synthFCD'):
         super().__init__()
         self.synth            = synth
         self.target_labels    = target_labels or []
-        self.native_synthesis = native_synthesis
+        self.approach         = approach
+        self.native_synthesis = (approach == 'nativeSynth')
 
     # ------------------------------------------------------------------
     # Public API
@@ -862,7 +872,7 @@ class Model(pl.LightningModule):
             flair_modality: bool = False,
             flair_stats_csv: Optional[str] = FLAIR_STATS_CSV,
             n_tracked_batches: int = 2,
-            native_synthesis: bool = False,
+            approach: str = 'synthFCD',          # 'synthFCD' | 'nativeSynth' | 'normal'
             val_diagnostics_interval: int = 10,
             use_lr_scheduler: bool = False,
             lesion_gmm_params: Optional[dict] = None,  # GMM (μ, σ) for label 21 — native path only
@@ -872,8 +882,17 @@ class Model(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        # ── Native Approach ───────────────────────────────────────────────────────
-        self.native_synthesis  = native_synthesis
+        # ── Approach ────────────────────────────────────────────────────────────
+        # 'synthFCD'    → SynthFCD path (post-hoc FCD injection)   [native_synthesis=False]
+        # 'nativeSynth' → Native SynthSeg path (lesion via GMM)    [native_synthesis=True]
+        # 'normal'      → Real-supervised: train on real FLAIR + real labels (no synthesis)
+        _VALID_APPROACHES = {'synthFCD', 'nativeSynth', 'normal'}
+        if approach not in _VALID_APPROACHES:
+            raise ValueError(
+                f"Unsupported approach '{approach}'. Choose from: {sorted(_VALID_APPROACHES)}"
+            )
+        self.approach          = approach
+        self.native_synthesis  = (approach == 'nativeSynth')   # derived — internal logic unchanged
         self.lesion_gmm_params = lesion_gmm_params or {'mu': (100, 180), 'sigma': (5, 20)}
 
         # ── Pipeline debugger ─────────────────────────────────────────────────────
@@ -882,7 +901,7 @@ class Model(pl.LightningModule):
         # Example CLI usage:
         #   --model.debug_subject_ids '["sub-00001", "sub-00027", "sub-00065"]'
         modality_tag = "flair" if flair_modality else "random"
-        synth_tag    = "native" if native_synthesis else "synthFCD"
+        synth_tag    = "native" if approach == 'nativeSynth' else "synthFCD"
         self._pipeline_debugger = SynthesisPipelineDebugger(
             debug_subject_ids=set(debug_subject_ids or []),
             output_root=os.path.join(OUTPUT_FOLDER, f"pipeline_debug_{modality_tag}_{synth_tag}"),
@@ -957,8 +976,12 @@ class Model(pl.LightningModule):
         print(f"  Trainable params: {trainable:,}")
 
         # ── Synthesis Pipeline ────────────────────────────────────────────────
-        approach = "Native SynthSeg Approach" if self.hparams.native_synthesis else "SynthFCD Approach"
-        print(f"\nDEBUG: Synthesis Pipeline  [{approach}]")
+        approach_name = {
+            'synthFCD':    "SynthFCD Approach",
+            'nativeSynth': "Native SynthSeg Approach",
+            'normal':      "Normal Approach (real-supervised — train on real FLAIR + labels)",
+        }.get(self.approach, self.approach)
+        print(f"\nDEBUG: Synthesis Pipeline  [{approach_name}]")
         print("─" * 60)
         print(f"  SharedSynth.synth type : {type(self.network.synth.synth).__name__}")
         gmm = getattr(self.network.synth.synth, 'gmm', None)
@@ -967,7 +990,11 @@ class Model(pl.LightningModule):
         print(f"  IntensityAug type      : {type(self.intensity_aug).__name__}")
         print(f"  Subject params cached  : {len(self.subject_params_cache)} subjects")
 
-        if self.hparams.native_synthesis:
+        if self.approach == 'normal':
+            print(f"  Training on            : REAL FLAIR + real labels  [single-branch supervised]")
+            print(f"  Synthetic gradient     : disabled  [simg discarded; deformation reused for aug]")
+            print(f"  FCDAugmentations       : disabled  [normal path]")
+        elif self.native_synthesis:
             print(f"  Lesion GMM (class 21)  : {self.lesion_gmm_params}  [injected per-step]")
             print(f"  FCDAugmentations       : disabled  [native path — GMM handles lesion appearance]")
         else:
@@ -981,7 +1008,10 @@ class Model(pl.LightningModule):
             print(f"  Subjects to debug      : {sorted(dbg.debug_subject_ids)}")
             print(f"  Output root            : {dbg.output_root}")
             print(f"  Save once per subject  : {dbg.save_once}")
-            if self.hparams.native_synthesis:
+            if self.approach == 'normal':
+                print(f"  Stages saved           : 0=inputs, 5=rimg_intensity  "
+                      f"[normal path — no synthesis/FCD-aug stages]")
+            elif self.native_synthesis:
                 print(f"  Stages saved           : 0=inputs, 1=synth, "
                       f"3=intensity, 5=rimg_intensity")
             else:
@@ -993,8 +1023,9 @@ class Model(pl.LightningModule):
         # ── FCD Probability Maps ──────────────────────────────────────────────
         if self.prob_map_subject_ids:
             print(f"\n  FCD Prob Maps          : ENABLED for {sorted(self.prob_map_subject_ids)}")
+            _maps = "real P(FCD)" if self.approach == 'normal' else "real + synth P(FCD)"
             print(f"  Saved every            : {self.val_diagnostics_interval} epochs  "
-                  f"(real + synth P(FCD) → images/epoch-XXXX/prob_<subject_id>/)")
+                  f"({_maps} → images/epoch-XXXX/prob_<subject_id>/)")
         else:
             print(f"  FCD Prob Maps          : DISABLED (no prob_map_subject_ids set)")
 
@@ -1053,7 +1084,7 @@ class Model(pl.LightningModule):
             )
             raw.intensity = IdentityTransform()
 
-        return SharedSynth(raw, target_labels=self.target_labels, native_synthesis=self.native_synthesis)
+        return SharedSynth(raw, target_labels=self.target_labels, approach=self.approach)
 
     def _build_loss(self, loss: str):
         options = {
@@ -1085,7 +1116,7 @@ class Model(pl.LightningModule):
             else FLAIR_CLASS_PARAMS
         )
         if self.hparams.flair_modality:
-            if self.hparams.native_synthesis:
+            if self.native_synthesis:
                 params = dict(params)
                 if 21 not in params:  # only uses lesion_gmm_params as fallback if 21 not in CSV
                     params[21] = self.lesion_gmm_params
@@ -1217,7 +1248,7 @@ class Model(pl.LightningModule):
         subject_id = batch.get('subject_id', [None] * len(batch['label_t']))[i]
 
         # Validate the actual synthesis input — fusedmask on native path, labelmap otherwise
-        input_t = batch['fusedmask_t'][i] if self.hparams.native_synthesis else label_t
+        input_t = batch['fusedmask_t'][i] if self.native_synthesis else label_t
         if input_t.sum() == 0 or torch.isnan(input_t.float()).any():
             return None
 
@@ -1228,14 +1259,48 @@ class Model(pl.LightningModule):
         is_debug = dbg.is_debug_subject(subject_id, aug_type)
         if is_debug:
             fusedmask_for_debug = (
-                batch['fusedmask_t'][i] if self.hparams.native_synthesis else None
+                batch['fusedmask_t'][i] if self.native_synthesis else None
             )
             dbg.save_stage0_inputs(
                 subject_id, label_t, flair_t, roi_t, fusedmask_for_debug
             )
 
+        # ── Normal (real-supervised) path ─────────────────────────────────────────
+        # Train directly on the real FLAIR + real label — no GMM-synthesised image
+        # feeds the gradient.  SharedSynth still runs (it owns the debugged deformation),
+        # but its synthetic output is discarded; we keep only the deformed real volumes.
+        # The same augmented-real pair is returned in both the train slots (0,1) and the
+        # eval slots (2,3): training_step backprops slot 0, validation reads slot 2.
+        if self.approach == 'normal':
+            simg, slab, rimg, rlab, rroi = self.network.synth(label_t, flair_t, label_t, roi_t)
+            del simg, slab                       # synthetic branch unused on this path
+            rroi_3d = (rroi.squeeze(0) > 0).long()
+
+            # Fuse the (deformed) ROI into the (deformed) real label as class 6 (FCD)
+            rlab_with_fcd              = rlab.long().squeeze(0).clone()
+            rlab_with_fcd[rroi_3d > 0] = 6
+
+            # Normalise the deformed real FLAIR to [0,1], then intensity-augment
+            rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
+            rimg_norm = self.rimg_normalizer.make_final(rimg_norm)(rimg_norm)
+            rimg_out  = self.intensity_aug(rimg_norm)
+            rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
+
+            if not torch.isfinite(rimg_norm).all():
+                bad = (~torch.isfinite(rimg_norm)).sum().item()
+                print(f"[WARN] normal: IntensityTransform produced {bad} non-finite voxels "
+                      f"for subject={subject_id} — skipping sample")
+                return None
+
+            if is_debug:
+                dbg.save_stage5_after_intensity(subject_id, rimg_norm)
+                dbg.mark_saved(subject_id)
+
+            real_mask_out = rlab_with_fcd.unsqueeze(0)
+            return (rimg_norm, real_mask_out, rimg_norm, real_mask_out)
+
         # ── Native synthesis path ─────────────────────────────────────────────────
-        if self.hparams.native_synthesis:
+        if self.native_synthesis:
             fusedmask_t = input_t  # already extracted above
 
             # fusedmask acts as both slab (GMM input) and lab (real branch label target)
@@ -1398,10 +1463,21 @@ class Model(pl.LightningModule):
             return None
         aug_image, aug_mask, real_image, real_mask, _ = result  # subject_ids unused in training
 
-        loss_synth, loss_real = self.network.train_step(
-            aug_image, aug_mask, real_image, real_mask)
+        if self.approach == 'normal':
+            # Single-branch supervised training on the augmented REAL pair
+            # (carried in the aug_image / aug_mask slots on the normal path).
+            opt = self.optimizers()
+            opt.zero_grad()
+            self.network.train()
+            pred = self.network.segnet(aug_image)
+            loss = self.network.loss(pred, aug_mask)
+            self.manual_backward(loss)
+            opt.step()
+        else:
+            loss_synth, loss_real = self.network.train_step(
+                aug_image, aug_mask, real_image, real_mask)
+            loss = loss_synth + self.alpha * loss_real
 
-        loss              = loss_synth + self.alpha * loss_real
         actual_batch_size = aug_image.shape[0]
         self.log('train_loss', loss, prog_bar=True, batch_size=actual_batch_size)
         return loss
@@ -1417,8 +1493,16 @@ class Model(pl.LightningModule):
                 return None
             aug_image, aug_mask, real_image, real_mask, subject_ids = result
 
-            loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
-                aug_image, aug_mask, real_image, real_mask)
+            if self.approach == 'normal':
+                # Single forward on the real pair — no separate synthetic branch.
+                self.network.eval()
+                pred_real  = self.network.segnet(real_image)
+                loss       = self.network.loss(pred_real, real_mask)   # honest real loss (no 2x)
+                pred_synth = pred_real                                  # alias for downstream caches/diagnostics
+            else:
+                loss_synth, loss_real, pred_synth, pred_real = self.network.eval_for_plot(
+                    aug_image, aug_mask, real_image, real_mask)
+                loss = loss_synth + self.alpha * loss_real
 
         pred_labels       = pred_real.cpu().argmax(dim=1)
         target_labels     = real_mask.cpu().squeeze(1).long()
@@ -1426,7 +1510,6 @@ class Model(pl.LightningModule):
         self.val_dice.update(pred_labels, target_labels)
         self.val_dice_fcd.update(pred_labels, target_labels)
 
-        loss              = loss_synth + self.alpha * loss_real
         actual_batch_size = aug_image.shape[0]
 
         self.log('eval_loss', loss, prog_bar=True, batch_size=actual_batch_size)
@@ -1478,13 +1561,14 @@ class Model(pl.LightningModule):
         if self.prob_map_subject_ids \
                 and self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0:
             real_prob_fcd  = torch.softmax(pred_real,  dim=1)[:, 6]   # (B, D, H, W)
-            synth_prob_fcd = torch.softmax(pred_synth, dim=1)[:, 6]   # (B, D, H, W)
+            # On the normal path pred_synth IS pred_real, so the synth map is redundant — skip it.
+            synth_prob_fcd = None if self.approach == 'normal' else torch.softmax(pred_synth, dim=1)[:, 6]
             for j, subj_id in enumerate(subject_ids):
                 if subj_id in self.prob_map_subject_ids:
                     self._val_prob_cache.append({
                         'subject_id': subj_id,
                         'real_prob':  real_prob_fcd[j].cpu(),
-                        'synth_prob': synth_prob_fcd[j].cpu(),
+                        'synth_prob': None if synth_prob_fcd is None else synth_prob_fcd[j].cpu(),
                     })
 
         # ── Cache for NIfTI diagnostics — best N + worst N ────────────────────────
@@ -1606,7 +1690,8 @@ class Model(pl.LightningModule):
                 prob_dir = os.path.join(epoch_dir, f"prob_{pc['subject_id']}")
                 makedirs(prob_dir, exist_ok=True)
                 save(pc['real_prob'],  os.path.join(prob_dir, 'real-prob-fcd.nii.gz'))
-                save(pc['synth_prob'], os.path.join(prob_dir, 'synth-prob-fcd.nii.gz'))
+                if pc['synth_prob'] is not None:
+                    save(pc['synth_prob'], os.path.join(prob_dir, 'synth-prob-fcd.nii.gz'))
 
         # ── Epoch-level metrics ───────────────────────────────────────────────────
         dice_epoch   = self.val_dice.compute()
@@ -1980,7 +2065,7 @@ class CLI(LightningCLI):
             "checkpoint.filename":       "checkpoint-{epoch:02d}-{eval_loss:.2f}-{val_dice:.2f}",
             "checkpoint.every_n_epochs": 1,
         })
-        parser.link_arguments("model.native_synthesis", "data.native_synthesis")
+        parser.link_arguments("model.approach", "data.approach")
 
     def instantiate_trainer(self, **kwargs):
         run_name = os.environ.get(
