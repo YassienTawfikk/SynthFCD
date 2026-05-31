@@ -22,16 +22,18 @@ python ../scripts/train_non_parametric_synthFCD.py fit \
   --data.eval 0.2 \
   --data.fcd_intensity_range "[0.02, 0.3602]" \
   --data.fcd_tail_range "[14, 29]" \
-  --data.split_seed 42 \
-  --data.use_extra_data true \
+  --data.split_seed 0 \
+  --data.use_extra_data false \
   \
-  --model.native_synthesis false \
+  --model.approach normal \
   --model.flair_modality true \
   --model.seg_nb_levels 6 \
   --model.seg_features "[16,32,64,128,256,512]" \
   --model.time_limit_minutes "$TRAINING_TIME_MINUTES" \
   --model.val_diagnostics_interval 10 \
-  --model.use_lr_scheduler false \
+  --model.use_lr_scheduler true \
+  --model.optimizer_options '{"lr": 1e-4}' \
+  --model.prob_map_subject_ids '["sub-00001", "sub-00033", "sub-00044", "sub-00002", "sub-00058", "sub-00065"]' \
   --model.debug_subject_ids '["sub-00001", "sub-00033", "sub-00044", "sub-00002", "sub-00058", "sub-00065"]' \
   \
   --trainer.default_root_dir "$EXPERIMENTS_DIR" \
