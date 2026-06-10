@@ -167,7 +167,7 @@ class LearnableSynthSeg(nn.Module):
 class SynthSeg(nn.Module):
     """A SynthSeg network, except that we evaluate it on real data as well"""
 
-    def __init__(self, segnet, synth, loss):
+    def __init__(self, segnet, synth, loss, alpha=1.0):
         """
 
         Parameters
@@ -184,6 +184,7 @@ class SynthSeg(nn.Module):
         self.segnet = segnet
         self.synth = synth
         self.loss = loss
+        self.alpha = alpha
         self.optim = None
         self.backward = None
         self.optimizers = None
@@ -235,17 +236,18 @@ class SynthSeg(nn.Module):
         self.train()
         synth_pred = self.segnet(synth_image)
         synth_loss = self.loss(synth_pred, synth_ref)
-        if self.backward:
-            self.backward(synth_loss)
-        else:
-            synth_loss.backward()
-        optim.step()
 
-        self.eval()
-        with torch.no_grad():
-            # real forward
-            real_pred = self.segnet(real_image)
-            real_loss = self.loss(real_pred, real_ref)
+        # real forward — now part of backprop
+        real_pred = self.segnet(real_image)
+        real_loss = self.loss(real_pred, real_ref)
+
+        total_loss = synth_loss + self.alpha * real_loss
+
+        if self.backward:
+            self.backward(total_loss)
+        else:
+            total_loss.backward()
+        optim.step()
 
         return synth_loss, real_loss
 
