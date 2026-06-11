@@ -2141,11 +2141,14 @@ class CLI(LightningCLI):
         # the CURRENT epoch, rewritten every epoch.  Decoupled from any monitored
         # metric, so it can never freeze at the best-eval_loss epoch (the resume bug
         # where last.ckpt was pinned to whichever epoch eval_loss last improved).
+        # enable_version_counter=False → always writes exactly "last.ckpt" (overwrite),
+        # never "last-v1.ckpt"/"last-v2.ckpt" when a stale last.ckpt is restored on resume.
         cbs.append(ModelCheckpoint(
-            dirpath        = ckpt_dir,
-            save_top_k     = 0,
-            save_last      = True,
-            every_n_epochs = 1,
+            dirpath                = ckpt_dir,
+            save_top_k             = 0,
+            save_last              = True,
+            every_n_epochs         = 1,
+            enable_version_counter = False,
         ))
 
         # ── Additional checkpoints ────────────────────────────────────────────
