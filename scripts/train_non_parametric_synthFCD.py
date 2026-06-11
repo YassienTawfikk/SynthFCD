@@ -878,6 +878,7 @@ class Model(pl.LightningModule):
             lesion_gmm_params: Optional[dict] = None,  # GMM (μ, σ) for label 21 — native path only
             debug_subject_ids: Optional[list] = None,  # subject IDs to save pipeline stages for
             prob_map_subject_ids: Optional[list] = None,  # subject IDs to save FCD prob maps for
+            clean_val: bool = False,                    # validation uses clean (un-deformed, un-augmented) real FLAIR
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -901,7 +902,7 @@ class Model(pl.LightningModule):
         # Example CLI usage:
         #   --model.debug_subject_ids '["sub-00001", "sub-00027", "sub-00065"]'
         modality_tag = "flair" if flair_modality else "random"
-        synth_tag    = "native" if approach == 'nativeSynth' else "synthFCD"
+        synth_tag    = {'nativeSynth': 'native', 'normal': 'normal'}.get(approach, 'synthFCD')
         self._pipeline_debugger = SynthesisPipelineDebugger(
             debug_subject_ids=set(debug_subject_ids or []),
             output_root=os.path.join(OUTPUT_FOLDER, f"pipeline_debug_{modality_tag}_{synth_tag}"),
@@ -947,6 +948,13 @@ class Model(pl.LightningModule):
         #   --model.prob_map_subject_ids '["sub-00001", "sub-00033"]'
         self.prob_map_subject_ids     = set(prob_map_subject_ids or [])
         self._val_prob_cache          = []   # {subject_id, real_prob, synth_prob} per save epoch
+
+        # ── Clean validation (real branch) ────────────────────────────────────
+        # When True, validation evaluates the REAL branch on the un-deformed,
+        # normalized-only real FLAIR (no geometric/intensity augmentation), giving a
+        # low-variance, deployment-aligned metric for checkpoint selection + reporting.
+        # Training stays fully augmented; the synthetic branch is unaffected.
+        self.clean_val                = clean_val
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Lifecycle hooks
@@ -999,6 +1007,10 @@ class Model(pl.LightningModule):
             print(f"  FCDAugmentations       : disabled  [native path — GMM handles lesion appearance]")
         else:
             print(f"  FCDAugmentations       : {type(self.fcd_aug).__name__}")
+
+        _val_mode = ("clean real FLAIR (no deform/intensity aug)" if self.clean_val
+                     else "augmented real FLAIR (deform + intensity)")
+        print(f"  Validation real branch : {_val_mode}")
 
         # ── Pipeline Debugger ─────────────────────────────────────────────────
         dbg = self._pipeline_debugger
@@ -1216,7 +1228,25 @@ class Model(pl.LightningModule):
 
         return img, roi
 
-    def _process_single_sample(self, batch: dict, i: int):
+    def _clean_real_pair(self, flair_t, label_t, roi_t, fusedmask_t=None):
+        """Validation-only real pair: un-deformed, normalized-only real FLAIR + its
+        matching un-deformed label (remapped to model classes via the same LUT used
+        on the augmented path).  No geometric or intensity augmentation is applied, so
+        image and label stay aligned and the metric reflects clean-image performance.
+        """
+        img = flair_t.float() if flair_t.dim() == 4 else flair_t.float().unsqueeze(0)
+        img = self.rimg_normalizer.make_final(img)(img)
+
+        remap = self.network.synth.remap_labels
+        if self.native_synthesis:
+            lab = remap(fusedmask_t).long().squeeze(0)            # lesion 21 → class 6 inside remap
+        else:
+            lab = remap(label_t).long().squeeze(0).clone()
+            roi_mask = (roi_t.squeeze(0) > 0) if roi_t.dim() == 4 else (roi_t > 0)
+            lab[roi_mask] = 6                                      # fuse ROI as FCD class 6
+        return img, lab.unsqueeze(0)
+
+    def _process_single_sample(self, batch: dict, i: int, clean: bool = False):
         """
         Full single-sample synthesis pipeline.
         native_synthesis=False : SharedSynth → FCD aug → IntensityTransform → label fusion
@@ -1272,6 +1302,9 @@ class Model(pl.LightningModule):
         # The same augmented-real pair is returned in both the train slots (0,1) and the
         # eval slots (2,3): training_step backprops slot 0, validation reads slot 2.
         if self.approach == 'normal':
+            if clean:
+                cimg, clab = self._clean_real_pair(flair_t, label_t, roi_t)
+                return (cimg, clab, cimg, clab)
             simg, slab, rimg, rlab, rroi = self.network.synth(label_t, flair_t, label_t, roi_t)
             del simg, slab                       # synthetic branch unused on this path
             rroi_3d = (rroi.squeeze(0) > 0).long()
@@ -1334,21 +1367,26 @@ class Model(pl.LightningModule):
                 dbg.mark_saved(subject_id)
 
             # slab_out and rlab_out already have class 6 from remap_labels — no label fusion needed
-            rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
-            rimg_norm = self.rimg_normalizer.make_final(rimg_norm)(rimg_norm)
-            rimg_out  = self.intensity_aug(rimg_norm)
-            rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
-
-            # ── Debug: Stage 5 — rimg after normalization + IntensityTransform ──────
-            if is_debug:
-                dbg.save_stage5_after_intensity(subject_id, rimg_norm)
-                dbg.mark_saved(subject_id)
+            if clean:
+                # Validation: real branch on clean FLAIR; synth branch stays as-is.
+                real_img_out, real_lab_out = self._clean_real_pair(
+                    flair_t, label_t, roi_t, fusedmask_t=input_t)
+            else:
+                rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
+                rimg_norm = self.rimg_normalizer.make_final(rimg_norm)(rimg_norm)
+                rimg_out  = self.intensity_aug(rimg_norm)
+                rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
+                # ── Debug: Stage 5 — rimg after normalization + IntensityTransform ──
+                if is_debug:
+                    dbg.save_stage5_after_intensity(subject_id, rimg_norm)
+                    dbg.mark_saved(subject_id)
+                real_img_out, real_lab_out = rimg_norm, rlab_out.long()
 
             return (
                 aug_image_item,
                 slab_out.long(),
-                rimg_norm,
-                rlab_out.long(),
+                real_img_out,
+                real_lab_out,
             )
 
         # ── Augmented synthesis path (original) ───────────────────────────────────
@@ -1403,23 +1441,27 @@ class Model(pl.LightningModule):
             )
             dbg.mark_saved(subject_id)
 
-        rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
-        rimg_norm = self.rimg_normalizer.make_final(rimg_norm)(rimg_norm)
-        rimg_out  = self.intensity_aug(rimg_norm)
-        rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
-
-        # ── Debug: Stage 5 — rimg after normalization + IntensityTransform ──────────
-        if is_debug:
-            dbg.save_stage5_after_intensity(subject_id, rimg_norm)
+        if clean:
+            # Validation: real branch on clean FLAIR; synth branch stays as-is.
+            real_img_out, real_lab_out = self._clean_real_pair(flair_t, label_t, roi_t)
+        else:
+            rimg_norm = rimg.float() if rimg.dim() == 4 else rimg.float().unsqueeze(0)
+            rimg_norm = self.rimg_normalizer.make_final(rimg_norm)(rimg_norm)
+            rimg_out  = self.intensity_aug(rimg_norm)
+            rimg_norm = rimg_out[0] if isinstance(rimg_out, (list, tuple)) else rimg_out
+            # ── Debug: Stage 5 — rimg after normalization + IntensityTransform ──────
+            if is_debug:
+                dbg.save_stage5_after_intensity(subject_id, rimg_norm)
+            real_img_out, real_lab_out = rimg_norm, rlab_with_fcd.unsqueeze(0)
 
         return (
             aug_image_item,
             slab_with_fcd.unsqueeze(0),
-            rimg_norm,
-            rlab_with_fcd.unsqueeze(0),
+            real_img_out,
+            real_lab_out,
         )
 
-    def synthesize_batch(self, batch: dict):
+    def synthesize_batch(self, batch: dict, clean: bool = False):
         """
         Run the synthesis pipeline for every sample in the batch.
         Returns stacked tensors + a list of subject_ids that survived synthesis
@@ -1433,7 +1475,7 @@ class Model(pl.LightningModule):
 
         with torch.autocast(device_type=device_type, enabled=False):
             for i in range(n):
-                out = self._process_single_sample(batch, i)
+                out = self._process_single_sample(batch, i, clean=clean)
                 if out is not None:
                     results.append(out)
                     subject_ids.append(sid_list[i])
@@ -1488,7 +1530,7 @@ class Model(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         with torch.no_grad():
-            result = self.synthesize_batch(batch)
+            result = self.synthesize_batch(batch, clean=self.clean_val)
             if result is None:
                 return None
             aug_image, aug_mask, real_image, real_mask, subject_ids = result
@@ -1621,12 +1663,12 @@ class Model(pl.LightningModule):
 
         NIfTIs are written to:
             <log_dir>/images/epoch-<XXXX>/<rank>_<subject_id>/
-                synth-pred.nii.gz
-                synth-image.nii.gz
-                synth-ref.nii.gz
                 real-pred.nii.gz
                 real-image.nii.gz
                 real-ref.nii.gz
+                synth-pred.nii.gz   ┐
+                synth-image.nii.gz  ├ synthFCD / nativeSynth only — skipped on the
+                synth-ref.nii.gz    ┘ normal path (they would alias the real files)
         """
         pred_synth_argmax = pred_synth[0].argmax(dim=0)
         pred_real_argmax  = pred_labels[0]
@@ -1643,12 +1685,16 @@ class Model(pl.LightningModule):
         subj_dir  = os.path.join(epoch_dir, f'{rank}_{subject_id}')
         makedirs(subj_dir, exist_ok=True)
 
-        save(pred_synth_argmax,                       os.path.join(subj_dir, 'synth-pred.nii.gz'))
+        # Real outputs — always saved.
         save(pred_real_argmax,                        os.path.join(subj_dir, 'real-pred.nii.gz'))
-        save(aug_image[0].squeeze(0),                 os.path.join(subj_dir, 'synth-image.nii.gz'))
         save(real_image[0].squeeze(0),                os.path.join(subj_dir, 'real-image.nii.gz'))
-        save(aug_mask[0].squeeze(0).to(torch.uint8),  os.path.join(subj_dir, 'synth-ref.nii.gz'))
         save(real_labels[0].to(torch.uint8),          os.path.join(subj_dir, 'real-ref.nii.gz'))
+        # Synthetic outputs — skipped on the normal path, where pred_synth and the
+        # aug_* slots simply alias the real pair (the files would be exact duplicates).
+        if self.approach != 'normal':
+            save(pred_synth_argmax,                       os.path.join(subj_dir, 'synth-pred.nii.gz'))
+            save(aug_image[0].squeeze(0),                 os.path.join(subj_dir, 'synth-image.nii.gz'))
+            save(aug_mask[0].squeeze(0).to(torch.uint8),  os.path.join(subj_dir, 'synth-ref.nii.gz'))
 
     def on_validation_epoch_end(self):
         # ── Save NIfTI diagnostics for best N + worst N cached batches ───────────
@@ -2060,7 +2106,7 @@ class CLI(LightningCLI):
         parser.add_lightning_class_args(ModelCheckpoint, "checkpoint")
         parser.set_defaults({
             "checkpoint.monitor":        "eval_loss",
-            "checkpoint.save_last":      True,
+            "checkpoint.save_last":      False,   # last.ckpt is owned by a dedicated unmonitored callback below
             "checkpoint.save_top_k":     1,
             "checkpoint.filename":       "checkpoint-{epoch:02d}-{eval_loss:.2f}-{val_dice:.2f}",
             "checkpoint.every_n_epochs": 1,
@@ -2087,10 +2133,20 @@ class CLI(LightningCLI):
 
         cbs = kwargs.get("callbacks", []) or []
 
-        # Registration order matters: EveryEpoch writes last.ckpt first,
-        # then CheckpointTrace inspects it, then LossGraph plots.
         cbs.append(LossGraphCallback())
         cbs.append(CheckpointTraceCallback())
+
+        # ── Latest checkpoint (drives resume) ─────────────────────────────────
+        # Unmonitored + save_top_k=0 + save_last=True → last.ckpt is a real copy of
+        # the CURRENT epoch, rewritten every epoch.  Decoupled from any monitored
+        # metric, so it can never freeze at the best-eval_loss epoch (the resume bug
+        # where last.ckpt was pinned to whichever epoch eval_loss last improved).
+        cbs.append(ModelCheckpoint(
+            dirpath        = ckpt_dir,
+            save_top_k     = 0,
+            save_last      = True,
+            every_n_epochs = 1,
+        ))
 
         # ── Additional checkpoints ────────────────────────────────────────────
         cbs.append(ModelCheckpoint(
