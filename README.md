@@ -5,7 +5,7 @@
 [![Status: Research in Progress](https://img.shields.io/badge/Status-Research%20in%20Progress-orange.svg)](#results)
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/0f1af2cc-a6bf-49d8-994b-8570a9cb9bbc" alt="SynthFCD Pipeline" width="100%">
+  <img src="https://github.com/user-attachments/assets/31dabe94-59b1-4f44-bc43-af62ed7dd85d" alt="SynthFCD Pipeline" width="100%">
   <br>
 </p>
 
