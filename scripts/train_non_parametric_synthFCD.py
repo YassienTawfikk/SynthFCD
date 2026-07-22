@@ -881,7 +881,7 @@ class Model(pl.LightningModule):
             clean_val: bool = False,                    # validation uses clean (un-deformed, un-augmented) real FLAIR
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['prob_map_subject_ids', 'debug_subject_ids'])
 
         # ── Approach ────────────────────────────────────────────────────────────
         # 'synthFCD'    → SynthFCD path (post-hoc FCD injection)   [native_synthesis=False]
@@ -1304,6 +1304,13 @@ class Model(pl.LightningModule):
         if self.approach == 'normal':
             if clean:
                 cimg, clab = self._clean_real_pair(flair_t, label_t, roi_t)
+                # Debug: save the clean (un-deformed, normalized-only) real FLAIR as the
+                # stage-5 artifact so debug subjects that live in the validation set are
+                # still captured when clean_val=True (otherwise this branch returns first
+                # and the subject is never saved).
+                if is_debug:
+                    dbg.save_stage5_after_intensity(subject_id, cimg)
+                    dbg.mark_saved(subject_id)
                 return (cimg, clab, cimg, clab)
             simg, slab, rimg, rlab, rroi = self.network.synth(label_t, flair_t, label_t, roi_t)
             del simg, slab                       # synthetic branch unused on this path
@@ -1595,22 +1602,24 @@ class Model(pl.LightningModule):
         if subj_metrics:
             self._val_all_subj_metrics.extend(subj_metrics)
 
-        # ── FCD probability-map cache (opt-in subjects, save epochs only) ─────────
+        # ── Class probability-map cache (opt-in subjects, save epochs only) ───────
         # pred_real / pred_synth are raw logits (SegNet built with activation=None);
-        # softmax(.., dim=1)[:, 6] is P(class 6 = FCD lesion).  NB: channel 6 here,
-        # NOT 5 — the raw output keeps the background channel (dice drops it → 5).
-        # Cache only the single FCD channel on CPU to keep memory minimal.
+        # softmax(.., dim=1) is the full per-voxel class distribution over all 7
+        # channels (sums to 1 along dim=1).  Channel order matches the raw network
+        # output: 0=bg, 1=WM, 2=cortex, 3=deepGM, 4=CSF, 5=WM-GM sep, 6=FCD lesion.
+        # Cached on CPU as (7, D, H, W) — ~7× the single-channel map, fine for a few
+        # opt-in subjects on save epochs only.
         if self.prob_map_subject_ids \
                 and self.trainer.current_epoch % self.hparams.val_diagnostics_interval == 0:
-            real_prob_fcd  = torch.softmax(pred_real,  dim=1)[:, 6]   # (B, D, H, W)
+            real_prob  = torch.softmax(pred_real,  dim=1)            # (B, 7, D, H, W)
             # On the normal path pred_synth IS pred_real, so the synth map is redundant — skip it.
-            synth_prob_fcd = None if self.approach == 'normal' else torch.softmax(pred_synth, dim=1)[:, 6]
+            synth_prob = None if self.approach == 'normal' else torch.softmax(pred_synth, dim=1)
             for j, subj_id in enumerate(subject_ids):
                 if subj_id in self.prob_map_subject_ids:
                     self._val_prob_cache.append({
                         'subject_id': subj_id,
-                        'real_prob':  real_prob_fcd[j].cpu(),
-                        'synth_prob': None if synth_prob_fcd is None else synth_prob_fcd[j].cpu(),
+                        'real_prob':  real_prob[j].cpu(),                                  # (7, D, H, W)
+                        'synth_prob': None if synth_prob is None else synth_prob[j].cpu(),  # (7, D, H, W)
                     })
 
         # ── Cache for NIfTI diagnostics — best N + worst N ────────────────────────
@@ -1724,10 +1733,13 @@ class Model(pl.LightningModule):
                 rank       = 'worst',
             )
 
-        # ── Save FCD probability maps for opt-in subjects ─────────────────────────
+        # ── Save class probability maps for opt-in subjects ───────────────────────
         # Written to <log_dir>/images/epoch-<XXXX>/prob_<subject_id>/
-        #   real-prob-fcd.nii.gz   — P(FCD) on the real FLAIR (3D float)
-        #   synth-prob-fcd.nii.gz  — P(FCD) on the synthetic image (3D float)
+        #   real-prob-allclasses.nii.gz   — full 7-class P on the real FLAIR  (4D)
+        #   synth-prob-allclasses.nii.gz  — full 7-class P on the synthetic image (4D)
+        # Saved channels-last (D, H, W, 7) — NIfTI convention — so each voxel
+        # [x, y, z, :] is the 7-element class distribution (sums to 1).  Channel
+        # order: 0=bg, 1=WM, 2=cortex, 3=deepGM, 4=CSF, 5=WM-GM sep, 6=FCD.
         # The cache is only populated on save epochs, so this is a no-op otherwise.
         if self._val_prob_cache:
             base_dir  = self.trainer.log_dir or self.trainer.default_root_dir
@@ -1735,9 +1747,11 @@ class Model(pl.LightningModule):
             for pc in self._val_prob_cache:
                 prob_dir = os.path.join(epoch_dir, f"prob_{pc['subject_id']}")
                 makedirs(prob_dir, exist_ok=True)
-                save(pc['real_prob'],  os.path.join(prob_dir, 'real-prob-fcd.nii.gz'))
+                save(pc['real_prob'].permute(1, 2, 3, 0).contiguous(),
+                     os.path.join(prob_dir, 'real-prob-allclasses.nii.gz'))
                 if pc['synth_prob'] is not None:
-                    save(pc['synth_prob'], os.path.join(prob_dir, 'synth-prob-fcd.nii.gz'))
+                    save(pc['synth_prob'].permute(1, 2, 3, 0).contiguous(),
+                         os.path.join(prob_dir, 'synth-prob-allclasses.nii.gz'))
 
         # ── Epoch-level metrics ───────────────────────────────────────────────────
         dice_epoch   = self.val_dice.compute()
