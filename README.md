@@ -4,6 +4,20 @@
 [![Dataset: OpenNeuro](https://img.shields.io/badge/Dataset-OpenNeuro%20ds004199-blue.svg)](https://openneuro.org/datasets/ds004199)
 [![Status: Research in Progress](https://img.shields.io/badge/Status-Research%20in%20Progress-orange.svg)](#results)
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/0f1af2cc-a6bf-49d8-994b-8570a9cb9bbc" alt="SynthFCD Pipeline" width="100%">
+  <br>
+</p>
+
+## Overview
+
+The only public FCD Type II benchmark contains 85 patients. Every supervised method on this dataset — including our own [nnU-FCD](https://github.com/YassienTawfikk/nnU-FCD) — is limited by data scarcity before it is limited by anything else. SynthFCD tests whether that bottleneck can be removed by generating training images instead of collecting them.
+
+> **This is an active research repository.** SynthFCD does **not** currently outperform the supervised nnU-Net baseline. It is released as a complete, reproducible pipeline together with an honest account of where it falls short.
+
+---
+
+
 **PyTorch implementation** of SynthFCD — a SynthSeg-derived pipeline that trains a 3D UNet to segment Focal Cortical Dysplasia lesions using FLAIR volumes synthesized on-the-fly from anatomical label maps, without using real images in the training branch.
 
 <p align="center">
@@ -11,14 +25,6 @@
   <br>
   <em>Figure: The SynthFCD pipeline. A label map is deformed, converted to an image by per-class Gaussian Mixture sampling, given FCD lesion appearance, and corrupted with bias field, gamma, and noise before reaching the network.</em>
 </p>
-
----
-
-## Overview
-
-The only public FCD Type II benchmark contains 85 patients. Every supervised method on this dataset — including our own [nnU-FCD](https://github.com/YassienTawfikk/nnU-FCD) — is limited by data scarcity before it is limited by anything else. SynthFCD tests whether that bottleneck can be removed by generating training images instead of collecting them.
-
-> **This is an active research repository.** SynthFCD does **not** currently outperform the supervised nnU-Net baseline. It is released as a complete, reproducible pipeline together with an honest account of where it falls short.
 
 ---
 
